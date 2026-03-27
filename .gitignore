@@ -1,0 +1,48 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Django
+*.sqlite3
+db.sqlite3
+staticfiles/
+
+# AI agent artifacts
+.claude/
+plan.md
+MEMORY.md
+.cursor/
+.copilot/
+.aider*
+
+# Docs & presentations (local only)
+docs/
+*.pdf
+*.pptx
+*.docx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes (local)
+postgres_data/
+ollama_data/
+redis_data/
+
+# Node (if any)
+node_modules/
