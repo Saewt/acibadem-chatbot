@@ -23,18 +23,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --retries 20 --timeout 120 -r requirements.txt
 
-COPY .model_cache /build/.model_cache
-
 ARG EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
 ENV EMBEDDING_MODEL=${EMBEDDING_MODEL} \
     HF_HOME=/build/.model_cache \
     TRANSFORMERS_CACHE=/build/.model_cache \
     SENTENCE_TRANSFORMERS_HOME=/build/.model_cache \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-RUN python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ.get('EMBEDDING_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'), local_files_only=True)"
+RUN mkdir -p /build/.model_cache \
+    && python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ.get('EMBEDDING_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'))"
 
 # ===== Stage 2: Runtime =====
 FROM python:3.12-slim

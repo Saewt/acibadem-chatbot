@@ -49,9 +49,10 @@ Bu komut:
 - PostgreSQL + pgvector container'ını başlatır
 - Redis container'ını başlatır
 - Django image'ını build eder
+- Build sırasında embedding modelini indirir
 - migrate, collectstatic ve `warm_models` komutlarını çalıştırır
 
-İlk build uzun sürebilir. Image içinde Playwright Chromium ve embedding modeli bulunduğu için birkaç dakika beklemek normaldir.
+İlk build uzun sürebilir. Temiz clone'da ekstra bir `.model_cache` klasörü gerekmiyor; image build sırasında embedding modeli ve Playwright Chromium indirildiği için birkaç dakika beklemek normaldir.
 
 ### 5. Hızlı veri bootstrap yap
 
@@ -145,6 +146,13 @@ Ardından web loglarını incele:
 
 ```powershell
 docker compose logs web
+```
+
+İlk build sırasında internet erişimi yoksa embedding modeli image içine indirilemeyebilir. Bu durumda bağlantıyı doğrulayıp image'ı yeniden build et:
+
+```powershell
+docker compose build --no-cache web
+docker compose up -d
 ```
 
 ### `localhost:8000` açılmıyor
