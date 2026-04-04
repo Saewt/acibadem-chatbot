@@ -41,8 +41,10 @@ Thumbs.db
 
 # Docker volumes (local)
 postgres_data/
-ollama_data/
 redis_data/
+
+# Model cache
+.model_cache/
 
 # Node (if any)
 node_modules/

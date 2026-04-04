@@ -1,6 +1,8 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    mem_limit: 512m
+    memswap_limit: 512m
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
@@ -13,24 +15,10 @@ services:
       timeout: 5s
       retries: 5
 
-  ollama:
-    image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
-      - ./scripts/ollama-entrypoint.sh:/ollama-entrypoint.sh
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags | grep -q 'qwen3'"]
-      interval: 30s
-      timeout: 10s
-      retries: 20
-      start_period: 120s
-    entrypoint: ["/bin/bash", "/ollama-entrypoint.sh"]
-    environment:
-      LLM_MODEL: ${LLM_MODEL:-qwen3:4b}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
-
   redis:
     image: redis:7-alpine
+    mem_limit: 128m
+    memswap_limit: 128m
     volumes:
       - redis_data:/data
     healthcheck:
@@ -41,12 +29,12 @@ services:
 
   web:
     build: ./webapp
+    mem_limit: 2g
+    memswap_limit: 2g
     ports:
       - "8000:8000"
     depends_on:
       db:
-        condition: service_healthy
-      ollama:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -55,9 +43,9 @@ services:
     command: >
       sh -c "python manage.py collectstatic --noinput &&
              python manage.py migrate &&
-             python manage.py runserver 0.0.0.0:8000"
+             python manage.py warm_models &&
+             exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 1 --worker-class gthread --threads 2 --timeout 300 --access-logfile -"
 
 volumes:
   postgres_data:
-  ollama_data:
   redis_data:

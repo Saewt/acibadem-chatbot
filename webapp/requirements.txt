@@ -1,8 +1,12 @@
 django>=5.0,<6.0
 psycopg2-binary>=2.9
 pgvector>=0.3
-requests>=2.31
-scrapy>=2.11
+openai>=1.0
+sentence-transformers>=3.0
+protobuf>=5.28
 playwright>=1.40
+requests>=2.31
 beautifulsoup4>=4.12
 redis>=5.0
+gunicorn>=22.0
+whitenoise>=6.5

@@ -21,6 +21,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -57,6 +58,7 @@ DATABASES = {
         'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'acu_password'),
         'HOST': os.environ.get('POSTGRES_HOST', 'db'),
         'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+        'CONN_MAX_AGE': 600,
     }
 }
 
@@ -85,7 +87,39 @@ CACHES = {
     }
 }
 
-OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://ollama:11434')
-LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen3:4b')
-EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'nomic-embed-text')
+MODEL_RUNNER_HOST = os.environ.get(
+    'MODEL_RUNNER_HOST', 'http://model-runner.docker.internal'
+).rstrip('/')
+MODEL_RUNNER_BASE_URL = f'{MODEL_RUNNER_HOST}/engines/v1'
+LLM_MODEL = os.environ.get('LLM_MODEL', 'ai/qwen3:4B-UD-Q4_K_XL')
+EMBEDDING_MODEL = os.environ.get(
+    'EMBEDDING_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'
+)
 CACHE_TTL = int(os.environ.get('CACHE_TTL', '3600'))
+RAG_RETRIEVE_LIMIT = int(os.environ.get('RAG_RETRIEVE_LIMIT', '6'))
+RAG_PER_PAGE_LIMIT = int(os.environ.get('RAG_PER_PAGE_LIMIT', '3'))
+RAG_MAX_CHUNK_CHARS = int(os.environ.get('RAG_MAX_CHUNK_CHARS', '700'))
+RAG_MAX_CONTEXT_CHARS = int(os.environ.get('RAG_MAX_CONTEXT_CHARS', '4000'))
+CHAT_WARMUP_ENABLED = os.environ.get('CHAT_WARMUP_ENABLED', 'True') == 'True'
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        }
+    },
+    'loggers': {
+        'chat': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'scraper': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}

@@ -3,7 +3,74 @@
 {% block title %}Acıbadem Üniversitesi AI Asistanı{% endblock %}
 
 {% block content %}
-<!-- TODO: Phase 4.1 — chat UI implementation -->
-<h1>ACU Chatbot</h1>
-<p>Yakında...</p>
+<main class="chat-app">
+    <aside class="chat-sidebar">
+        <div class="chat-sidebar-head">
+            <p class="sidebar-eyebrow">Conversation History</p>
+            <h1 class="chat-sidebar-title">ACU Asistan</h1>
+            <p class="chat-sidebar-note">Son 20 konuşma listeleniyor.</p>
+        </div>
+
+        <ul class="conversation-list">
+            {% for conversation in conversations %}
+                <li>
+                    <button
+                        type="button"
+                        class="conversation-item"
+                        data-conversation-id="{{ conversation.id }}"
+                    >
+                        <span class="conversation-title">{{ conversation.title|default:"Yeni konuşma" }}</span>
+                        <span class="conversation-date">{{ conversation.created_at|date:"d.m.Y H:i" }}</span>
+                    </button>
+                </li>
+            {% empty %}
+                <li class="conversation-empty">Henüz kayıtlı konuşma yok.</li>
+            {% endfor %}
+        </ul>
+
+        <button type="button" id="new-chat-btn" class="new-chat-btn">+ Yeni sohbet</button>
+    </aside>
+
+    <section class="chat-main">
+        <header class="chat-header">
+            <div class="chat-header-main">
+                <span class="status-dot" aria-hidden="true"></span>
+                <div>
+                    <div class="chat-title">ACU Asistan</div>
+                    <p class="chat-subtitle">Resmi üniversite kaynaklarından yanıt üretir.</p>
+                </div>
+            </div>
+            <p id="status-text" class="status-text">Hazır.</p>
+        </header>
+
+        <div class="message-stream" id="message-stream">
+            <article class="message assistant">
+                <div class="message-meta">
+                    <span class="message-label">ACU ASISTAN</span>
+                </div>
+                <p class="message-body">
+                    Merhaba. Sorunu Türkçe yazabilirsin. Yanıtlar yalnızca indekslenmiş resmi
+                    kaynaklardan üretilecek.
+                </p>
+            </article>
+        </div>
+
+        <form id="chat-form" class="chat-form">
+            <label for="question" class="sr-only">Sorun</label>
+            <div class="chat-input-row">
+                <input
+                    type="text"
+                    id="question"
+                    name="question"
+                    placeholder="Sorunuzu Türkçe veya İngilizce yazın..."
+                    autocomplete="off"
+                    required
+                >
+                <button type="submit" aria-label="Mesajı gönder">
+                    <span aria-hidden="true">&rarr;</span>
+                </button>
+            </div>
+        </form>
+    </section>
+</main>
 {% endblock %}
