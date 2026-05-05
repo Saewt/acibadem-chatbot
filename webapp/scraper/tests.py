@@ -1,13 +1,19 @@
+import json
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 import requests
 from django.conf import settings
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
+from django.test.utils import override_settings
 
-from .embeddings import DEFAULT_EMBEDDING_BATCH_SIZE, iter_text_embedding_batches
-from .models import ContentChunk, WebPage
+from .embeddings import DEFAULT_EMBEDDING_BATCH_SIZE, _embed_via_api, iter_text_embedding_batches
+from .dataset_import import _build_general_pages
+from .models import ContentChunk, KnowledgeSyncState, WebPage
 from .services import (
     DEFAULT_MAIN_SITE_SEEDS,
     build_chunk_embedding_text,
@@ -25,6 +31,7 @@ from .services import (
     extract_main_site_page,
     fetch_html,
     upsert_page_content,
+    upsert_page_chunks,
 )
 
 
@@ -58,6 +65,136 @@ class ScraperConfigTests(SimpleTestCase):
         self.assertEqual(index.opclasses, ['vector_cosine_ops'])
 
 
+class BootstrapKnowledgeCommandTests(TestCase):
+    def _create_dataset_snapshot(self, root: Path) -> None:
+        for relative_path in (
+            'acibadem_output/sources_clean.jsonl',
+            'acibadem_output/chunks_clean.jsonl',
+            'acibadem_output/records_clean.jsonl',
+            'bologna_courses/sources.jsonl',
+            'bologna_courses/records.jsonl',
+        ):
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('', encoding='utf-8')
+
+        summary_path = root / 'bologna_courses/summary.json'
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text('{"programs": []}', encoding='utf-8')
+
+    @override_settings(KNOWLEDGE_BOOTSTRAP_ENABLED=False)
+    def test_bootstrap_knowledge_skips_when_disabled(self):
+        out = StringIO()
+
+        call_command('bootstrap_knowledge', stdout=out)
+
+        self.assertIn('bootstrap_knowledge skipped: disabled by settings.', out.getvalue())
+
+    @patch('scraper.management.commands.bootstrap_knowledge._release_bootstrap_lock')
+    @patch('scraper.management.commands.bootstrap_knowledge._acquire_bootstrap_lock', return_value=False)
+    def test_bootstrap_knowledge_skips_when_lock_is_held(
+        self, _acquire_bootstrap_lock_mock, _release_bootstrap_lock_mock
+    ):
+        out = StringIO()
+
+        call_command('bootstrap_knowledge', stdout=out)
+
+        self.assertIn('another process is already bootstrapping', out.getvalue())
+        _release_bootstrap_lock_mock.assert_not_called()
+
+    @patch('scraper.management.commands.bootstrap_knowledge.call_command')
+    @patch('scraper.management.commands.bootstrap_knowledge._release_bootstrap_lock')
+    @patch('scraper.management.commands.bootstrap_knowledge._acquire_bootstrap_lock', return_value=True)
+    def test_bootstrap_knowledge_noops_when_active_pages_exist(
+        self,
+        _acquire_bootstrap_lock_mock,
+        _release_bootstrap_lock_mock,
+        call_command_mock,
+    ):
+        WebPage.objects.create(
+            url='https://example.com/existing',
+            source='main_site',
+            title='Existing',
+            content_text='Existing content',
+            raw_html='<main>Existing content</main>',
+            content_hash='hash',
+            is_active=True,
+        )
+        out = StringIO()
+
+        call_command('bootstrap_knowledge', stdout=out)
+
+        self.assertIn('active knowledge pages already exist', out.getvalue())
+        call_command_mock.assert_not_called()
+        _release_bootstrap_lock_mock.assert_called_once()
+
+    @override_settings(KNOWLEDGE_BOOTSTRAP_FAIL_ON_MISSING_DATA=True)
+    @patch('scraper.management.commands.bootstrap_knowledge._release_bootstrap_lock')
+    @patch('scraper.management.commands.bootstrap_knowledge._acquire_bootstrap_lock', return_value=True)
+    def test_bootstrap_knowledge_fails_when_required_dataset_files_are_missing(
+        self, _acquire_bootstrap_lock_mock, _release_bootstrap_lock_mock
+    ):
+        with TemporaryDirectory() as tmpdir:
+            with self.assertRaisesMessage(
+                CommandError,
+                'bootstrap_knowledge missing dataset files:',
+            ):
+                call_command('bootstrap_knowledge', dataset_root=tmpdir)
+
+        _release_bootstrap_lock_mock.assert_called_once()
+
+    @override_settings(KNOWLEDGE_BOOTSTRAP_FAIL_ON_MISSING_DATA=False)
+    @patch('scraper.management.commands.bootstrap_knowledge.call_command')
+    @patch('scraper.management.commands.bootstrap_knowledge._release_bootstrap_lock')
+    @patch('scraper.management.commands.bootstrap_knowledge._acquire_bootstrap_lock', return_value=True)
+    def test_bootstrap_knowledge_warns_when_missing_dataset_is_allowed(
+        self,
+        _acquire_bootstrap_lock_mock,
+        _release_bootstrap_lock_mock,
+        call_command_mock,
+    ):
+        out = StringIO()
+
+        with TemporaryDirectory() as tmpdir:
+            call_command('bootstrap_knowledge', dataset_root=tmpdir, stdout=out)
+
+        self.assertIn('bootstrap_knowledge missing dataset files:', out.getvalue())
+        call_command_mock.assert_not_called()
+        _release_bootstrap_lock_mock.assert_called_once()
+
+    @patch('scraper.management.commands.bootstrap_knowledge.call_command')
+    @patch('scraper.management.commands.bootstrap_knowledge._release_bootstrap_lock')
+    @patch('scraper.management.commands.bootstrap_knowledge._acquire_bootstrap_lock', return_value=True)
+    def test_bootstrap_knowledge_imports_dataset_when_db_is_empty(
+        self,
+        _acquire_bootstrap_lock_mock,
+        _release_bootstrap_lock_mock,
+        call_command_mock,
+    ):
+        with TemporaryDirectory() as tmpdir:
+            dataset_root = Path(tmpdir)
+            self._create_dataset_snapshot(dataset_root)
+            out = StringIO()
+
+            call_command(
+                'bootstrap_knowledge',
+                dataset_root=str(dataset_root),
+                rebuild_embeddings=True,
+                stdout=out,
+            )
+
+        call_command_mock.assert_called_once()
+        args = call_command_mock.call_args.args
+        kwargs = call_command_mock.call_args.kwargs
+        self.assertEqual(args, ('import_acibadem_dataset',))
+        self.assertEqual(kwargs['dataset_root'], str(dataset_root))
+        self.assertFalse(kwargs['force_refresh'])
+        self.assertFalse(kwargs['skip_embeddings'])
+        self.assertTrue(kwargs['rebuild_embeddings'])
+        self.assertIs(kwargs['stdout']._out, out)
+        _release_bootstrap_lock_mock.assert_called_once()
+
+
 class ScraperServiceTests(TestCase):
     def test_build_chunk_embedding_text_prefixes_metadata(self):
         embedding_text = build_chunk_embedding_text(
@@ -65,6 +202,9 @@ class ScraperServiceTests(TestCase):
             {
                 'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
                 'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+                'curriculum_year': '2025',
+                'period_label': '3. Yarıyıl Ders Planı',
+                'record_type': 'bologna_semester_plan',
                 'section_title': 'Bölüm Başkanı',
                 'page_title': 'Bölüm Başkanı',
             },
@@ -72,6 +212,9 @@ class ScraperServiceTests(TestCase):
 
         self.assertIn('Program: Bilgisayar Mühendisliği (İngilizce)', embedding_text)
         self.assertIn('Fakulte: Mühendislik ve Doğa Bilimleri Fakültesi', embedding_text)
+        self.assertIn('MufredatYili: 2025', embedding_text)
+        self.assertIn('Donem: 3. Yarıyıl Ders Planı', embedding_text)
+        self.assertIn('KayitTuru: bologna_semester_plan', embedding_text)
         self.assertIn('Bolum: Bölüm Başkanı', embedding_text)
         self.assertIn('Baslik: Bölüm Başkanı', embedding_text)
         self.assertTrue(embedding_text.endswith('Icerik: Başkanlık bilgisi burada yer alır.'))
@@ -631,15 +774,7 @@ class ScraperServiceTests(TestCase):
         self.assertEqual(programs[0]['cur_sunit'], '6246')
         self.assertEqual(programs[0]['faculty'], 'Mühendislik ve Doğa Bilimleri Fakültesi')
 
-    @patch('scraper.services.iter_text_embedding_batches')
-    def test_upsert_page_content_recreates_chunks_when_content_changes(
-        self, iter_batches_mock
-    ):
-        def fake_iter(texts, batch_size=DEFAULT_EMBEDDING_BATCH_SIZE):
-            self.assertEqual(batch_size, DEFAULT_EMBEDDING_BATCH_SIZE)
-            yield 0, [build_vector(0.0) for _ in texts]
-
-        iter_batches_mock.side_effect = fake_iter
+    def test_upsert_page_content_recreates_chunks_when_content_changes(self):
         page, changed = upsert_page_content(
             source='main_site',
             url='https://www.acibadem.edu.tr/akademik',
@@ -666,16 +801,7 @@ class ScraperServiceTests(TestCase):
         self.assertEqual(WebPage.objects.count(), 1)
         self.assertEqual(page.chunks.count(), ContentChunk.objects.count())
 
-    @patch('scraper.services.iter_text_embedding_batches')
-    def test_upsert_page_content_assigns_embeddings_across_batches(self, iter_batches_mock):
-        def fake_iter(texts, batch_size=DEFAULT_EMBEDDING_BATCH_SIZE):
-            self.assertEqual(batch_size, DEFAULT_EMBEDDING_BATCH_SIZE)
-            self.assertEqual(len(texts), 3)
-            self.assertTrue(all(text.startswith('Baslik: Bolum\nIcerik: ') for text in texts))
-            yield 0, [build_vector(1.0), build_vector(2.0)]
-            yield 2, [build_vector(3.0)]
-
-        iter_batches_mock.side_effect = fake_iter
+    def test_upsert_page_content_creates_chunks_without_embeddings(self):
         text = '\n\n'.join(['A' * 600, 'B' * 600, 'C' * 600])
 
         page, changed = upsert_page_content(
@@ -690,14 +816,9 @@ class ScraperServiceTests(TestCase):
         self.assertTrue(changed)
         chunks = list(page.chunks.order_by('chunk_index'))
         self.assertEqual(len(chunks), 3)
-        self.assertEqual(
-            [normalize_vector(chunk.embedding) for chunk in chunks],
-            [build_vector(1.0), build_vector(2.0), build_vector(3.0)],
-        )
+        self.assertEqual([chunk.embedding for chunk in chunks], [None, None, None])
 
-    @patch('scraper.services.iter_text_embedding_batches')
-    def test_upsert_page_content_truncates_titles_to_model_limit(self, iter_batches_mock):
-        iter_batches_mock.return_value = [(0, [build_vector(1.0)])]
+    def test_upsert_page_content_truncates_titles_to_model_limit(self):
         long_title = 'T' * 520
 
         page, changed = upsert_page_content(
@@ -714,9 +835,7 @@ class ScraperServiceTests(TestCase):
         self.assertEqual(page.title, long_title[:500])
         self.assertEqual(page.chunks.get().metadata['page_title'], long_title[:500])
 
-    @patch('scraper.services.iter_text_embedding_batches')
-    def test_upsert_page_content_syncs_chunk_metadata_without_rebuild(self, iter_batches_mock):
-        iter_batches_mock.return_value = [(0, [build_vector(1.0)])]
+    def test_upsert_page_content_rebuilds_chunks_when_page_metadata_changes(self):
         url = 'https://obs.acibadem.edu.tr/oibs/bologna/progOfficials.aspx?curSunit=6246&lang=tr'
         text = 'Yeterince uzun bir bologna içerik metni burada yer alıyor ve kaydedilmeli.'
 
@@ -735,7 +854,6 @@ class ScraperServiceTests(TestCase):
 
         original_chunk = page.chunks.get()
         original_chunk_id = original_chunk.id
-        original_embedding = normalize_vector(original_chunk.embedding)
 
         page, changed = upsert_page_content(
             source='bologna',
@@ -750,14 +868,47 @@ class ScraperServiceTests(TestCase):
             },
         )
 
-        self.assertFalse(changed)
+        self.assertTrue(changed)
         updated_chunk = page.chunks.get()
-        self.assertEqual(updated_chunk.id, original_chunk_id)
-        self.assertEqual(normalize_vector(updated_chunk.embedding), original_embedding)
+        self.assertNotEqual(updated_chunk.id, original_chunk_id)
+        self.assertIsNone(updated_chunk.embedding)
         self.assertEqual(
             updated_chunk.metadata['faculty'], 'Mühendislik ve Doğa Bilimleri Fakültesi'
         )
-        self.assertEqual(iter_batches_mock.call_count, 1)
+
+    def test_upsert_page_chunks_persists_prebuilt_chunk_metadata(self):
+        page, changed = upsert_page_chunks(
+            source='bologna',
+            url='https://obs.acibadem.edu.tr/oibs/bologna/progCourses.aspx?curSunit=6246&lang=tr#period-3',
+            title='Bilgisayar Mühendisliği - 3. Yarıyıl Ders Planı',
+            text='Özet içerik',
+            raw_html='{}',
+            metadata={
+                'kind': 'bologna_program_page',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+                'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+                'curriculum_year': '2025',
+            },
+            chunks=[
+                {
+                    'text': 'CSE 201 Veri Yapıları | AKTS: 6',
+                    'metadata': {
+                        'record_type': 'bologna_semester_plan',
+                        'chunk_level': 'semester_plan',
+                        'period_label': '3. Yarıyıl Ders Planı',
+                        'period_number': 3,
+                    },
+                    'chunk_index': 0,
+                }
+            ],
+        )
+
+        self.assertTrue(changed)
+        chunk = page.chunks.get()
+        self.assertEqual(chunk.metadata['chunk_level'], 'semester_plan')
+        self.assertEqual(chunk.metadata['period_number'], 3)
+        self.assertEqual(chunk.metadata['program_title'], 'Bilgisayar Mühendisliği (İngilizce)')
+        self.assertIsNone(chunk.embedding)
 
     @patch('scraper.services.mark_missing_pages_inactive', return_value=0)
     @patch('scraper.services.upsert_page_content', return_value=(Mock(), True))
@@ -1087,6 +1238,142 @@ class EmbeddingHelperTests(SimpleTestCase):
             ],
         )
 
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    @patch('scraper.embeddings.requests.post')
+    def test_iter_text_embedding_batches_uses_api_backend(self, post_mock):
+        responses = []
+        for vectors in ([build_vector(0.1), build_vector(0.2)], [build_vector(0.3)]):
+            response_mock = Mock(status_code=200)
+            response_mock.json.return_value = {'embeddings': vectors}
+            responses.append(response_mock)
+        post_mock.side_effect = responses
+
+        batches = list(iter_text_embedding_batches(['a', 'b', 'c'], batch_size=2))
+
+        self.assertEqual(
+            batches,
+            [
+                (0, [build_vector(0.1), build_vector(0.2)]),
+                (2, [build_vector(0.3)]),
+            ],
+        )
+        self.assertEqual(post_mock.call_count, 2)
+        self.assertEqual(
+            post_mock.call_args_list[0].kwargs['json'],
+            {'texts': ['a', 'b']},
+        )
+        self.assertEqual(
+            post_mock.call_args_list[1].kwargs['json'],
+            {'texts': ['c']},
+        )
+
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    @patch('scraper.embeddings.requests.post')
+    def test_embed_via_api_returns_embeddings(self, post_mock):
+        response_mock = Mock(status_code=200)
+        response_mock.json.return_value = {
+            'embeddings': [build_vector(0.1), build_vector(0.2)]
+        }
+        post_mock.return_value = response_mock
+
+        result = _embed_via_api(['hello', 'world'])
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], build_vector(0.1))
+        self.assertEqual(result[1], build_vector(0.2))
+        post_mock.assert_called_once_with(
+            'http://test-embedding:8001/embed',
+            json={'texts': ['hello', 'world']},
+            timeout=5,
+        )
+
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    @patch('scraper.embeddings.requests.post')
+    def test_embed_via_api_raises_on_timeout(self, post_mock):
+        post_mock.side_effect = requests.Timeout('timeout')
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _embed_via_api(['hello'])
+        self.assertIn('timed out', str(ctx.exception))
+
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    @patch('scraper.embeddings.requests.post')
+    def test_embed_via_api_raises_on_non_200(self, post_mock):
+        response_mock = Mock(status_code=500, text='Internal Server Error')
+        post_mock.return_value = response_mock
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _embed_via_api(['hello'])
+        self.assertIn('status 500', str(ctx.exception))
+
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    @patch('scraper.embeddings.requests.post')
+    def test_embed_via_api_raises_on_missing_embeddings_field(self, post_mock):
+        response_mock = Mock(status_code=200)
+        response_mock.json.return_value = {'data': []}
+        post_mock.return_value = response_mock
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _embed_via_api(['hello'])
+        self.assertIn("missing 'embeddings'", str(ctx.exception))
+
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    @patch('scraper.embeddings.requests.post')
+    def test_embed_via_api_raises_on_count_mismatch(self, post_mock):
+        response_mock = Mock(status_code=200)
+        response_mock.json.return_value = {'embeddings': [[0.1]]}
+        post_mock.return_value = response_mock
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _embed_via_api(['hello', 'world'])
+        self.assertIn('count mismatch', str(ctx.exception))
+
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    @patch('scraper.embeddings.requests.post')
+    def test_embed_via_api_raises_on_connection_error(self, post_mock):
+        post_mock.side_effect = requests.ConnectionError('refused')
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _embed_via_api(['hello'])
+        self.assertIn('unreachable', str(ctx.exception))
+
+    @override_settings(
+        EMBEDDING_BACKEND='api',
+        EMBEDDING_API_URL='http://test-embedding:8001',
+        EMBEDDING_API_TIMEOUT=5,
+    )
+    def test_embed_via_api_returns_empty_for_empty_input(self):
+        result = _embed_via_api([])
+        self.assertEqual(result, [])
+
 
 class GenerateEmbeddingsCommandTests(TestCase):
     def setUp(self):
@@ -1171,6 +1458,139 @@ class GenerateEmbeddingsCommandTests(TestCase):
             self.assertEqual(normalize_vector(chunk.embedding), build_vector(42.0))
 
 
+class DatasetImportTests(SimpleTestCase):
+    def test_build_general_pages_enriches_department_staff_and_head_metadata(self):
+        with TemporaryDirectory() as tmpdir:
+            dataset_root = Path(tmpdir)
+            output_dir = dataset_root / 'acibadem_output'
+            output_dir.mkdir(parents=True)
+
+            sources = [
+                {
+                    'source_id': 'staff-source',
+                    'url': 'https://www.acibadem.edu.tr/akademik/lisans/muhendislik-ve-doga-bilimleri-fakultesi/bolumler/bilgisayar-muhendisligi/akademik-kadro',
+                    'canonical_url': 'https://www.acibadem.edu.tr/akademik/lisans/muhendislik-ve-doga-bilimleri-fakultesi/bolumler/bilgisayar-muhendisligi/akademik-kadro',
+                    'host': 'www.acibadem.edu.tr',
+                    'source_group': 'department',
+                    'source_variant': 'default',
+                    'candidate_page_kind': None,
+                    'title': 'Bilgisayar Mühendisliği - Akademik Kadro',
+                    'text': 'Akademik kadro sayfası',
+                },
+                {
+                    'source_id': 'head-source',
+                    'url': 'https://www.acibadem.edu.tr/akademik/lisans/muhendislik-ve-doga-bilimleri-fakultesi/bolumler/bilgisayar-muhendisligi/bolum-baskaninin-mesaji',
+                    'canonical_url': 'https://www.acibadem.edu.tr/akademik/lisans/muhendislik-ve-doga-bilimleri-fakultesi/bolumler/bilgisayar-muhendisligi/bolum-baskaninin-mesaji',
+                    'host': 'www.acibadem.edu.tr',
+                    'source_group': 'department',
+                    'source_variant': 'default',
+                    'candidate_page_kind': None,
+                    'title': 'Bilgisayar Mühendisliği - Bölüm Başkanının Mesajı',
+                    'text': 'Bölüm başkanı sayfası',
+                },
+            ]
+            chunks = [
+                {
+                    'chunk_id': 'staff-chunk',
+                    'source_id': 'staff-source',
+                    'record_ids': ['staff-record'],
+                    'chunk_type': 'table_row',
+                    'title': 'Bilgisayar Mühendisliği - Akademik Kadro',
+                    'section_title': 'Akademik Kadro',
+                    'text': 'Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut | unvan: Prof. Dr.',
+                    'language': 'tr',
+                    'metadata': {
+                        'record_type': 'academic_staff_member',
+                        'entity_name': 'Ahmet Bulut',
+                        'unit_name': 'Bilgisayar Mühendisliği',
+                    },
+                },
+                {
+                    'chunk_id': 'head-chunk',
+                    'source_id': 'head-source',
+                    'record_ids': ['head-record'],
+                    'chunk_type': 'record_text',
+                    'title': 'Bilgisayar Mühendisliği - Bölüm Başkanının Mesajı',
+                    'section_title': 'Bölüm Başkanının Mesajı',
+                    'text': 'Bölüm Başkanı - Prof. Dr. Ahmet Bulut',
+                    'language': 'tr',
+                    'metadata': {
+                        'record_type': 'department_head_message',
+                        'entity_name': 'Bilgisayar Mühendisliği',
+                    },
+                },
+            ]
+            records = [
+                {
+                    'record_id': 'staff-record',
+                    'source_id': 'staff-source',
+                    'record_type': 'academic_staff_member',
+                    'entity_name': 'Ahmet Bulut',
+                    'payload': {
+                        'unit_name': 'Bilgisayar Mühendisliği',
+                        'unit_kind': 'department',
+                        'parent_unit_name': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+                        'faculty_root_name': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+                        'staff_title': 'Prof. Dr.',
+                    },
+                },
+                {
+                    'record_id': 'head-record',
+                    'source_id': 'head-source',
+                    'record_type': 'department_head_message',
+                    'entity_name': 'Bilgisayar Mühendisliği',
+                    'payload': {},
+                },
+            ]
+
+            for filename, rows in (
+                ('sources_clean.jsonl', sources),
+                ('chunks_clean.jsonl', chunks),
+                ('records_clean.jsonl', records),
+            ):
+                with (output_dir / filename).open('w') as handle:
+                    for row in rows:
+                        handle.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+            pages = _build_general_pages(dataset_root)
+            pages_by_title = {page['title']: page for page in pages}
+
+            staff_page = pages_by_title['Bilgisayar Mühendisliği - Akademik Kadro']
+            self.assertEqual(staff_page['metadata']['kind'], 'main_site_staff_page')
+            self.assertEqual(staff_page['metadata']['program_title'], 'Bilgisayar Mühendisliği')
+            self.assertEqual(
+                staff_page['metadata']['faculty'],
+                'Mühendislik ve Doğa Bilimleri Fakültesi',
+            )
+            self.assertIn(
+                'Bilgisayar Mühendisliği',
+                staff_page['metadata']['program_alias_text'],
+            )
+            self.assertEqual(
+                staff_page['chunks'][0]['metadata']['program_title'],
+                'Bilgisayar Mühendisliği',
+            )
+            self.assertEqual(
+                staff_page['chunks'][0]['metadata']['faculty'],
+                'Mühendislik ve Doğa Bilimleri Fakültesi',
+            )
+            self.assertEqual(
+                staff_page['chunks'][0]['metadata']['staff_title'],
+                'Prof. Dr.',
+            )
+
+            head_page = pages_by_title['Bilgisayar Mühendisliği - Bölüm Başkanının Mesajı']
+            self.assertEqual(head_page['metadata']['program_title'], 'Bilgisayar Mühendisliği')
+            self.assertIn(
+                'Bilgisayar Mühendisliği',
+                head_page['metadata']['program_alias_text'],
+            )
+            self.assertEqual(
+                head_page['chunks'][0]['metadata']['program_title'],
+                'Bilgisayar Mühendisliği',
+            )
+
+
 class ScrapeMainSiteCommandTests(SimpleTestCase):
     @patch('scraper.management.commands.scrape_main_site.crawl_candidate_data')
     @patch('scraper.management.commands.scrape_main_site.crawl_main_site')
@@ -1219,3 +1639,145 @@ class ScrapeMainSiteCommandTests(SimpleTestCase):
         output = stdout.getvalue()
         self.assertIn('candidate_seen=6', output)
         self.assertIn('candidate_structured_saved=4', output)
+
+
+class ImportDatasetCommandTests(SimpleTestCase):
+    @patch('scraper.management.commands.import_acibadem_dataset.call_command')
+    @patch('scraper.management.commands.import_acibadem_dataset.import_acibadem_dataset')
+    def test_import_dataset_command_runs_import_and_embeddings(
+        self,
+        import_dataset_mock,
+        call_command_mock,
+    ):
+        import_dataset_mock.return_value = {
+            'pages': 10,
+            'chunks': 24,
+            'main_site_pages': 4,
+            'structured_pages': 3,
+            'bologna_pages': 3,
+        }
+        stdout = StringIO()
+
+        call_command(
+            'import_acibadem_dataset',
+            dataset_root='/tmp/dataset',
+            stdout=stdout,
+        )
+
+        import_dataset_mock.assert_called_once_with(
+            dataset_root='/tmp/dataset',
+            force_refresh=False,
+        )
+        call_command_mock.assert_called_once_with(
+            'generate_embeddings',
+            rebuild=False,
+            stdout=stdout,
+        )
+        self.assertIn('import_acibadem_dataset completed', stdout.getvalue())
+
+
+class RepairStaffMetadataCommandTests(TestCase):
+    def test_repair_staff_metadata_backfills_program_metadata(self):
+        page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-akademik-kadro',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-repair-staff',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'staff_count': 2,
+                'source_group': 'department',
+            },
+        )
+        source_chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği - Akademik Kadro',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'chunk_type': 'source_text',
+            },
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=1,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'unit_name': 'Bilgisayar Mühendisliği',
+            },
+        )
+        stdout = StringIO()
+
+        call_command('repair_staff_metadata', stdout=stdout)
+
+        page.refresh_from_db()
+        source_chunk.refresh_from_db()
+        staff_chunk.refresh_from_db()
+        self.assertEqual(page.metadata['program_title'], 'Bilgisayar Mühendisliği')
+        self.assertIn('Bilgisayar Mühendisliği', page.metadata['program_alias_text'])
+        self.assertEqual(source_chunk.metadata['program_title'], 'Bilgisayar Mühendisliği')
+        self.assertEqual(staff_chunk.metadata['program_title'], 'Bilgisayar Mühendisliği')
+        self.assertIn('pages=1, chunks=2', stdout.getvalue())
+
+
+class SyncKnowledgeCommandTests(SimpleTestCase):
+    @patch('scraper.management.commands.sync_acibadem_knowledge.run_live_sync')
+    def test_sync_command_reports_noop_when_manifest_is_unchanged(self, run_live_sync_mock):
+        run_live_sync_mock.return_value = {
+            'changed': False,
+            'manifest_hash': 'abc123',
+            'last_manifest_hash': 'abc123',
+        }
+        stdout = StringIO()
+
+        call_command('sync_acibadem_knowledge', stdout=stdout)
+
+        self.assertIn('no-op', stdout.getvalue())
+
+    @patch('scraper.management.commands.sync_acibadem_knowledge.run_live_sync')
+    def test_sync_command_reports_updated_summaries(self, run_live_sync_mock):
+        run_live_sync_mock.return_value = {
+            'changed': True,
+            'manifest_hash': 'newhash',
+            'main_site': {'saved': 4},
+            'candidate': {'saved': 3},
+            'bologna': {'saved': 5},
+        }
+        stdout = StringIO()
+
+        call_command('sync_acibadem_knowledge', stdout=stdout)
+
+        self.assertIn('main_site_saved=4', stdout.getvalue())
+        self.assertIn('manifest_hash=newhash', stdout.getvalue())
+
+    @patch('scraper.management.commands.sync_acibadem_knowledge.run_live_sync')
+    def test_sync_command_reports_lock_skip(self, run_live_sync_mock):
+        run_live_sync_mock.return_value = {
+            'changed': False,
+            'skipped': True,
+            'reason': 'refresh_lock_held',
+        }
+        stdout = StringIO()
+
+        call_command('sync_acibadem_knowledge', stdout=stdout)
+
+        self.assertIn('skipped reason=refresh_lock_held', stdout.getvalue())
+
+
+class KnowledgeSchedulerCommandTests(TestCase):
+    @override_settings(KNOWLEDGE_SYNC_ENABLED=True, KNOWLEDGE_SYNC_RUN_ON_START=False)
+    @patch('scraper.management.commands.run_knowledge_scheduler.call_command')
+    def test_scheduler_does_not_sync_on_first_start_by_default(self, call_command_mock):
+        stdout = StringIO()
+
+        call_command('run_knowledge_scheduler', once=True, stdout=stdout)
+
+        call_command_mock.assert_not_called()
+        state = KnowledgeSyncState.objects.get(key=settings.KNOWLEDGE_SYNC_KEY)
+        self.assertIsNotNone(state.last_checked_at)
+        self.assertEqual(state.last_status, 'idle')
+        self.assertIn('Knowledge sync not due yet.', stdout.getvalue())

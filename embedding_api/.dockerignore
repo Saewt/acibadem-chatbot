@@ -1,12 +1,10 @@
 __pycache__
 *.py[cod]
 *.egg-info
-*.sqlite3
-.env
 .venv
 .pytest_cache
 .model_cache
-staticfiles
+.env
 .DS_Store
 .vscode
 .idea

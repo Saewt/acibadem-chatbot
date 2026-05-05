@@ -25,6 +25,8 @@ class ChatConfig(AppConfig):
             return
         if not _is_serving_process():
             return
+        if settings.EMBEDDING_BACKEND != 'local':
+            return
 
         from .services import warm_embedding_model
 

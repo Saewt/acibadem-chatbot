@@ -11,8 +11,14 @@ from scraper.models import ContentChunk, WebPage
 
 from .models import Conversation, Message
 from .services import (
+    LLM_BUSY_ANSWER,
+    LLMBusyError,
     NO_CONTEXT_ANSWER,
     _extract_question_scope_hints,
+    _filter_candidates_for_query,
+    _is_dentistry_query,
+    _is_staff_query,
+    _resolve_question_with_conversation,
     _retrieve_candidates,
     build_prompt,
     build_sources,
@@ -149,9 +155,9 @@ class ChatServiceTests(TestCase):
         key_b = cache_key('  psikoloji   bölümü 5 yarıyıl ders planı  ')
 
         self.assertEqual(key_a, key_b)
-        self.assertTrue(key_a.startswith('chat-answer:v3:'))
+        self.assertTrue(key_a.startswith('chat-answer:v7:'))
 
-    @override_settings(RAG_MAX_CHUNK_CHARS=20, RAG_MAX_CONTEXT_CHARS=140)
+    @override_settings(RAG_MAX_CHUNK_CHARS=20, RAG_MAX_CONTEXT_CHARS=155)
     def test_build_prompt_trims_context_and_limits_used_chunks(self):
         page = WebPage.objects.create(
             url='https://example.com/program',
@@ -203,6 +209,33 @@ class ChatServiceTests(TestCase):
         self.assertIn('Program: Bilgisayar Mühendisliği (İngilizce)', prompt)
         self.assertIn('Fakulte: Mühendislik ve Doğa Bilimleri Fakültesi', prompt)
         self.assertIn('Bolum/Sayfa: Bölüm Başkanı', prompt)
+
+    def test_build_prompt_includes_curriculum_metadata(self):
+        page = WebPage.objects.create(
+            url='https://example.com/semester-plan',
+            source='bologna',
+            title='3. Yarıyıl Ders Planı',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='CSE 201 Veri Yapıları | AKTS: 6',
+            metadata={
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+                'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+                'curriculum_year': '2025',
+                'period_label': '3. Yarıyıl Ders Planı',
+                'section_title': '3. Yarıyıl Ders Planı',
+            },
+        )
+
+        prompt, _used_chunks = build_prompt('Hemşirelik 3. yarıyıl dersler', [chunk])
+
+        self.assertIn('Mufredat Yili: 2025', prompt)
+        self.assertIn('Donem: 3. Yarıyıl Ders Planı', prompt)
 
     def test_build_prompt_prefers_metadata_source_url(self):
         page = WebPage.objects.create(
@@ -320,6 +353,22 @@ class ChatServiceTests(TestCase):
             hints,
         )
 
+    def test_dentistry_query_matches_common_turkish_terms(self):
+        self.assertTrue(_is_dentistry_query('Acıbadem Üniversitesinde dişçilik var mı?'))
+        self.assertTrue(_is_dentistry_query('Diş hekimliği bölümü var mı?'))
+
+    def test_followup_question_uses_previous_program_context(self):
+        conversation = Conversation.objects.create(title='Bilgisayar Mühendisliği')
+        Message.objects.create(
+            conversation=conversation,
+            role='user',
+            content='Bilgisayar mühendisliği hocaları kimler?',
+        )
+
+        resolved = _resolve_question_with_conversation('kaç tane hocası var', conversation)
+
+        self.assertEqual(resolved, 'bilgisayar mühendisliği kaç tane hocası var')
+
     @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
     @patch('chat.services.retrieve_keyword_context')
     @patch('chat.services.retrieve_context')
@@ -389,9 +438,80 @@ class ChatServiceTests(TestCase):
             [
                 ('bologna', 'bologna_staff_page'),
                 ('main_site', 'main_site_staff_page'),
-                ('bologna', 'bologna_program_page'),
             ],
         )
+
+    @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    def test_retrieve_candidates_prioritizes_main_site_staff_and_head_chunks_for_staff_queries(
+        self,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+    ):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-muhendisligi-akademik-kadro',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-staff',
+        )
+        head_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-muhendisligi-bolum-baskani',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Bölüm Başkanının Mesajı',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-head',
+        )
+        score_page = WebPage.objects.create(
+            url='https://example.com/structured-score',
+            source='structured',
+            title='Bilgisayar Mühendisliği (İngilizce) (%50 İndirimli) - Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-score',
+        )
+        score_chunk = ContentChunk.objects.create(
+            page=score_page,
+            chunk_index=0,
+            text='Taban puan 450, taban başarı sırası 30000.',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'record_type': 'quota_row',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'placement_label': 'Bilgisayar Mühendisliği (İngilizce) (%50 İndirimli)',
+            },
+        )
+        head_chunk = ContentChunk.objects.create(
+            page=head_page,
+            chunk_index=0,
+            text='Bölüm Başkanı - Prof. Dr. Ahmet Bulut',
+            metadata={
+                'record_type': 'department_head_message',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'section_title': 'Bölüm Başkanının Mesajı',
+            },
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'unit_name': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Ahmet Bulut',
+                'section_title': 'Akademik Kadro',
+            },
+        )
+        retrieve_context_mock.return_value = [score_chunk, head_chunk, staff_chunk]
+
+        results = _retrieve_candidates('Bilgisayar mühendisliği hocaları kimler?', [0.1, 0.2])
+
+        self.assertEqual(results, [staff_chunk, head_chunk])
 
     @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
     @patch('chat.services.retrieve_keyword_context', return_value=[])
@@ -495,6 +615,77 @@ class ChatServiceTests(TestCase):
 
         self.assertEqual(results, [])
 
+    @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    def test_retrieve_candidates_discards_non_topic_sources_for_erasmus_queries(
+        self,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+    ):
+        score_page = WebPage.objects.create(
+            url='https://example.com/score',
+            source='structured',
+            title='Bilgisayar Mühendisliği (İngilizce) - Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-erasmus-score',
+        )
+        erasmus_page = WebPage.objects.create(
+            url='https://example.com/erasmus',
+            source='main_site',
+            title='Erasmus Öğrenci Hareketliliği',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-erasmus-topic',
+        )
+        generic_page = WebPage.objects.create(
+            url='https://example.com/program-about',
+            source='bologna',
+            title='Program Hakkında',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-erasmus-about',
+        )
+        score_chunk = ContentChunk.objects.create(
+            page=score_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği kontenjan ve puan bilgileri.',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'record_type': 'quota_row',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+                'topic': 'admissions_scores',
+            },
+        )
+        erasmus_chunk = ContentChunk.objects.create(
+            page=erasmus_page,
+            chunk_index=0,
+            text='Erasmus öğrenci hareketliliği başvuru koşulları ve süreçleri.',
+            metadata={
+                'kind': 'candidate_topic_page',
+                'topic': 'international',
+                'topic_label': 'Uluslararası Olanaklar',
+            },
+        )
+        generic_chunk = ContentChunk.objects.create(
+            page=generic_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği program tanıtımı.',
+            metadata={
+                'kind': 'bologna_program_page',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+            },
+        )
+        retrieve_context_mock.return_value = [score_chunk, generic_chunk, erasmus_chunk]
+
+        results = _retrieve_candidates(
+            'erasmus bilgisi bilgisayar mühendisliği',
+            [0.1, 0.2],
+        )
+
+        self.assertEqual(results, [erasmus_chunk])
+
     @override_settings(RAG_RETRIEVE_LIMIT=2, RAG_PER_PAGE_LIMIT=2)
     @patch('chat.services.retrieve_keyword_context', return_value=[])
     @patch('chat.services.retrieve_context')
@@ -526,11 +717,62 @@ class ChatServiceTests(TestCase):
 
         self.assertEqual(results, [chunk])
 
-    @patch('chat.services.generate_answer')
+    @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    def test_retrieve_candidates_prioritizes_semester_plan_for_course_queries(
+        self,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+    ):
+        overview_page = WebPage.objects.create(
+            url='https://example.com/overview',
+            source='bologna',
+            title='Program Özeti',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-overview',
+        )
+        semester_page = WebPage.objects.create(
+            url='https://example.com/semester-3',
+            source='bologna',
+            title='3. Yarıyıl Ders Planı',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-semester',
+        )
+        overview_chunk = ContentChunk.objects.create(
+            page=overview_page,
+            chunk_index=0,
+            text='Toplam AKTS: 240',
+            metadata={
+                'program_title': 'Hemşirelik',
+                'record_type': 'bologna_program_overview',
+                'chunk_level': 'program_overview',
+            },
+        )
+        semester_chunk = ContentChunk.objects.create(
+            page=semester_page,
+            chunk_index=0,
+            text='HEM 301 İç Hastalıkları Hemşireliği | AKTS: 6',
+            metadata={
+                'program_title': 'Hemşirelik',
+                'record_type': 'bologna_semester_plan',
+                'chunk_level': 'semester_plan',
+                'period_label': '3. Yarıyıl Ders Planı',
+            },
+        )
+        retrieve_context_mock.return_value = [overview_chunk, semester_chunk]
+
+        results = _retrieve_candidates('Hemşirelik 3. yarıyıl dersler', [0.1, 0.2])
+
+        self.assertEqual(results, [semester_chunk, overview_chunk])
+
+    @patch('chat.services.generate_answer', return_value='LLM cevabı')
     @patch('chat.services.retrieve_keyword_context', return_value=[])
     @patch('chat.services.retrieve_context')
     @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
-    def test_chat_returns_no_context_when_scoped_program_has_no_matching_source(
+    def test_chat_calls_llm_when_scope_mismatch_but_chunks_exist(
         self,
         _embed_query_mock,
         retrieve_context_mock,
@@ -559,9 +801,8 @@ class ChatServiceTests(TestCase):
 
         payload = chat('Bilgisayar mühendisliği bölümünün başkanı kimdir?')
 
-        self.assertEqual(payload['answer'], NO_CONTEXT_ANSWER)
-        self.assertEqual(payload['sources'], [])
-        generate_answer_mock.assert_not_called()
+        generate_answer_mock.assert_called_once()
+        self.assertEqual(payload['answer'], 'LLM cevabı')
 
     @patch('chat.services.generate_answer')
     @patch('chat.services.retrieve_keyword_context', return_value=[])
@@ -628,6 +869,249 @@ class ChatServiceTests(TestCase):
         self.assertIn('Bilgisayar Mühendisliği (İngilizce) (Burslu): taban puan 490, taban başarı sırası 1200.', payload['answer'])
         self.assertIn('Bilgisayar Mühendisliği (İngilizce) (%50 İndirimli): taban puan 450, taban başarı sırası 30000.', payload['answer'])
         self.assertEqual(len(payload['sources']), 2)
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_structured_fee_answer_without_llm(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        fee_page = WebPage.objects.create(
+            url='https://example.com/structured-fee',
+            source='structured',
+            title='Bilgisayar Mühendisliği - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-fee',
+        )
+        fee_chunk = ContentChunk.objects.create(
+            page=fee_page,
+            chunk_index=0,
+            text='Ücretli: 900.000₺, %50 İndirimli: 450.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+                'fee_full': '900.000₺',
+                'fee_50': '450.000₺',
+                'notes': 'Ek burs seçeneği bulunmaktadır.',
+            },
+        )
+        retrieve_context_mock.return_value = [fee_chunk]
+
+        payload = chat('Bilgisayar mühendisliği ücreti ne kadar?')
+
+        self.assertIn('Bilgisayar Mühendisliği (İngilizce) için resmi öğrenim ücreti bilgileri:', payload['answer'])
+        self.assertIn('ücretli 900.000₺', payload['answer'])
+        self.assertIn('%50 indirimli 450.000₺', payload['answer'])
+        self.assertEqual(len(payload['sources']), 1)
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_clean_structured_fee_names(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        fee_page = WebPage.objects.create(
+            url='https://example.com/structured-fee-clean',
+            source='structured',
+            title='Bilgisayar Mühendisliği - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-fee-clean',
+        )
+        fee_chunk = ContentChunk.objects.create(
+            page=fee_page,
+            chunk_index=0,
+            text='Ücretli: 675.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)**',
+                'fee_full': '675.000₺',
+                'notes': 'Burs hakkında bilgi almak için tıklayın. Ek destek vardır.',
+            },
+        )
+        retrieve_context_mock.return_value = [fee_chunk]
+
+        payload = chat('Bilgisayar mühendisliği ücreti')
+
+        self.assertIn('Bilgisayar Mühendisliği (İngilizce) için', payload['answer'])
+        self.assertNotIn('**', payload['answer'])
+        self.assertNotIn('tıklayın', payload['answer'])
+        self.assertIn('Ek destek vardır.', payload['answer'])
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_structured_staff_count_without_llm(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-akademik-kadro',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-staff',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'staff_count': 3,
+            },
+        )
+        first_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Ahmet Bulut',
+                'staff_title': 'Prof. Dr.',
+                'staff_count': 3,
+            },
+        )
+        ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=1,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Seda Nilgün Dumlu | unvan: Öğr. Gör. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Seda Nilgün Dumlu',
+                'staff_title': 'Öğr. Gör. Dr.',
+                'staff_count': 3,
+            },
+        )
+        ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=2,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Seher Sonkaya | unvan: Arş. Gör.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Seher Sonkaya',
+                'staff_title': 'Arş. Gör.',
+                'staff_count': 3,
+            },
+        )
+        retrieve_context_mock.return_value = [first_chunk]
+
+        payload = chat('Bilgisayar mühendisliğinin kaç tane hocası var')
+
+        self.assertEqual(
+            payload['answer'],
+            'Bilgisayar Mühendisliği akademik kadro kaynağında 3 hoca kaydı var.',
+        )
+        self.assertEqual(len(payload['sources']), 1)
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_resolves_followup_staff_count_from_conversation(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        conversation = Conversation.objects.create(title='Bilgisayar Mühendisliği')
+        Message.objects.create(
+            conversation=conversation,
+            role='user',
+            content='Bilgisayar mühendisliği hocaları kimler?',
+        )
+        staff_page = WebPage.objects.create(
+            url='https://example.com/followup-staff',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-followup-staff',
+            metadata={'kind': 'main_site_staff_page', 'program_title': 'Bilgisayar Mühendisliği'},
+        )
+        chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Ahmet Bulut',
+                'staff_title': 'Prof. Dr.',
+                'staff_count': 1,
+            },
+        )
+        retrieve_context_mock.return_value = [chunk]
+
+        payload = chat('kaç tane hocası var', conversation_id=conversation.id)
+
+        self.assertEqual(
+            payload['answer'],
+            'Bilgisayar Mühendisliği akademik kadro kaynağında 1 hoca kaydı var.',
+        )
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_distinguishes_dentistry_from_oral_health_program(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        page = WebPage.objects.create(
+            url='https://example.com/agiz-dis',
+            source='bologna',
+            title='Ağız ve Diş Sağlığı - Programı Bilgileri',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-agiz-dis',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Ağız ve Diş Sağlığı Programı',
+            metadata={
+                'kind': 'bologna_program_page',
+                'program_title': 'Ağız ve Diş Sağlığı',
+                'faculty': 'Sağlık Hizmetleri Meslek Yüksekokulu',
+                'admission_level': 'onlisans',
+            },
+        )
+        retrieve_context_mock.return_value = [chunk]
+
+        payload = chat('Acıbadem üniversitesinde dişçilik bölümü var mı')
+
+        self.assertIn('Diş Hekimliği lisans programı bulamadım', payload['answer'])
+        self.assertIn('Ağız ve Diş Sağlığı programı var', payload['answer'])
+        self.assertIn('ön lisans', payload['answer'])
         generate_answer_mock.assert_not_called()
 
     @patch('chat.services.generate_answer')
@@ -714,11 +1198,224 @@ class ChatServiceTests(TestCase):
         self.assertEqual(Message.objects.filter(role='assistant').get().content, 'Parca 1 Parca 2 [1]')
         generate_answer_stream_mock.assert_called_once()
 
+    @patch('chat.services._acquire_llm_slot', side_effect=LLMBusyError('busy'))
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_busy_answer_without_caching(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+        _acquire_llm_slot_mock,
+    ):
+        page = WebPage.objects.create(
+            url='https://example.com/genel',
+            source='main_site',
+            title='Genel Bilgi',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-busy',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Model gerektiren genel resmi bilgi.',
+        )
+        retrieve_context_mock.return_value = [chunk]
+
+        payload = chat('Genel bilgi verir misin?')
+
+        self.assertEqual(payload['answer'], LLM_BUSY_ANSWER)
+        self.assertEqual(payload['sources'], [])
+        self.assertTrue(payload['busy'])
+        self.assertIsNone(cache.get(cache_key('Genel bilgi verir misin?')))
+        self.assertEqual(Message.objects.filter(role='assistant').get().content, LLM_BUSY_ANSWER)
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services._acquire_llm_slot', side_effect=LLMBusyError('busy'))
+    @patch('chat.services.generate_answer_stream')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_stream_returns_busy_answer_without_caching(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_stream_mock,
+        _acquire_llm_slot_mock,
+    ):
+        page = WebPage.objects.create(
+            url='https://example.com/stream-busy',
+            source='main_site',
+            title='Genel Bilgi',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-stream-busy',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Streaming model gerektiren genel resmi bilgi.',
+        )
+        retrieve_context_mock.return_value = [chunk]
+
+        payload = ''.join(chat_stream('Streaming genel bilgi verir misin?'))
+
+        self.assertIn(LLM_BUSY_ANSWER, payload)
+        self.assertIn('event: sources', payload)
+        self.assertIn('"sources": []', payload)
+        self.assertIsNone(cache.get(cache_key('Streaming genel bilgi verir misin?')))
+        self.assertEqual(Message.objects.filter(role='assistant').get().content, LLM_BUSY_ANSWER)
+        generate_answer_stream_mock.assert_not_called()
+
+    def test_is_staff_query_matches_baskan(self):
+        self.assertTrue(_is_staff_query('bilgisayar mühendisliği bölüm başkanı kimdir'))
+
+    def test_is_staff_query_matches_dekan(self):
+        self.assertTrue(_is_staff_query('dekan kimdir'))
+
+    def test_is_staff_query_matches_mudur(self):
+        self.assertTrue(_is_staff_query('müdür'))
+
+    def test_is_staff_query_matches_baskan_ascii(self):
+        self.assertTrue(_is_staff_query('bolum baskani kim'))
+
+    def test_is_staff_query_no_match_for_non_staff(self):
+        self.assertFalse(_is_staff_query('bilgisayar mühendisliği dersleri'))
+
+    def test_filter_candidates_prioritizes_staff_chunks_for_staff_queries(self):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/staff-page',
+            source='bologna',
+            title='Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-staff',
+        )
+        score_page = WebPage.objects.create(
+            url='https://example.com/score-page',
+            source='structured',
+            title='Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-score',
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Akademik kadro listesi.',
+            metadata={
+                'kind': 'bologna_staff_page',
+                'program_title': 'Bilgisayar Mühendisliği',
+            },
+        )
+        score_chunk = ContentChunk.objects.create(
+            page=score_page,
+            chunk_index=0,
+            text='Taban puan: 450.',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'program_title': 'Bilgisayar Mühendisliği',
+            },
+        )
+
+        result = _filter_candidates_for_query(
+            'bilgisayar mühendisliği bölüm başkanı kimdir',
+            [score_chunk, staff_chunk],
+        )
+
+        self.assertEqual(result, [staff_chunk])
+
+    def test_filter_candidates_falls_back_for_staff_queries_without_staff_chunks(self):
+        score_page = WebPage.objects.create(
+            url='https://example.com/score-page',
+            source='structured',
+            title='Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-score',
+        )
+        score_chunk = ContentChunk.objects.create(
+            page=score_page,
+            chunk_index=0,
+            text='Taban puan: 450.',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'program_title': 'Bilgisayar Mühendisliği',
+            },
+        )
+
+        result = _filter_candidates_for_query(
+            'bilgisayar mühendisliği bölüm başkanı kimdir',
+            [score_chunk],
+        )
+
+        self.assertEqual(result, [score_chunk])
+
+    @patch('chat.services.generate_answer', return_value='Başkan: Prof. Dr. Ahmet')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_finds_staff_chunks_for_baskan_query(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        head_page = WebPage.objects.create(
+            url='https://example.com/bolum-baskani',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Bölüm Başkanının Mesajı',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-head',
+        )
+        head_chunk = ContentChunk.objects.create(
+            page=head_page,
+            chunk_index=0,
+            text='Bölüm Başkanı - Prof. Dr. Ahmet Bulut',
+            metadata={
+                'record_type': 'department_head_message',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'section_title': 'Bölüm Başkanının Mesajı',
+            },
+        )
+        retrieve_context_mock.return_value = [head_chunk]
+
+        payload = chat('Bilgisayar mühendisliği bölüm başkanı kimdir?')
+
+        generate_answer_mock.assert_called_once()
+        self.assertEqual(payload['answer'], 'Başkan: Prof. Dr. Ahmet')
+
 
 class WarmModelsCommandTests(TestCase):
+    @override_settings(EMBEDDING_BACKEND='local')
     @patch('chat.management.commands.warm_models.warm_llm_model')
     @patch('chat.management.commands.warm_models.warm_embedding_model')
-    def test_warm_models_command_logs_success(self, warm_embedding_model_mock, warm_llm_model_mock):
+    def test_warm_models_command_skips_llm_warmup_by_default(
+        self, warm_embedding_model_mock, warm_llm_model_mock
+    ):
+        stdout = StringIO()
+
+        call_command('warm_models', stdout=stdout)
+
+        warm_embedding_model_mock.assert_called_once()
+        warm_llm_model_mock.assert_not_called()
+        output = stdout.getvalue()
+        self.assertIn('Warmup completed for embedding_model.', output)
+        self.assertIn('LLM warmup skipped: disabled by settings.', output)
+
+    @override_settings(EMBEDDING_BACKEND='local', LLM_WARMUP_ENABLED=True)
+    @patch('chat.management.commands.warm_models.warm_llm_model')
+    @patch('chat.management.commands.warm_models.warm_embedding_model')
+    def test_warm_models_command_logs_llm_success(
+        self, warm_embedding_model_mock, warm_llm_model_mock
+    ):
         stdout = StringIO()
 
         call_command('warm_models', stdout=stdout)
@@ -729,6 +1426,21 @@ class WarmModelsCommandTests(TestCase):
         self.assertIn('Warmup completed for embedding_model.', output)
         self.assertIn('Warmup completed for llm_model.', output)
 
+    @override_settings(EMBEDDING_BACKEND='local')
+    @patch('chat.management.commands.warm_models.warm_llm_model')
+    @patch('chat.management.commands.warm_models.warm_embedding_model')
+    def test_warm_models_command_llm_flag_overrides_default(
+        self, warm_embedding_model_mock, warm_llm_model_mock
+    ):
+        stdout = StringIO()
+
+        call_command('warm_models', llm=True, stdout=stdout)
+
+        warm_embedding_model_mock.assert_called_once()
+        warm_llm_model_mock.assert_called_once()
+        self.assertIn('Warmup completed for llm_model.', stdout.getvalue())
+
+    @override_settings(EMBEDDING_BACKEND='local', LLM_WARMUP_ENABLED=True)
     @patch('chat.management.commands.warm_models.warm_llm_model')
     @patch('chat.management.commands.warm_models.warm_embedding_model')
     def test_warm_models_command_warns_without_failing(
@@ -742,3 +1454,18 @@ class WarmModelsCommandTests(TestCase):
         warm_embedding_model_mock.assert_called_once()
         warm_llm_model_mock.assert_called_once()
         self.assertIn('Warmup failed for llm_model: runner unavailable', stdout.getvalue())
+
+    @override_settings(EMBEDDING_BACKEND='api')
+    @patch('chat.management.commands.warm_models.warm_llm_model')
+    @patch('chat.management.commands.warm_models.warm_embedding_model')
+    def test_warm_models_skips_embedding_warmup_in_api_mode(
+        self, warm_embedding_model_mock, warm_llm_model_mock
+    ):
+        stdout = StringIO()
+
+        call_command('warm_models', stdout=stdout)
+
+        warm_embedding_model_mock.assert_not_called()
+        warm_llm_model_mock.assert_not_called()
+        self.assertIn('skipping local warmup', stdout.getvalue())
+        self.assertIn('LLM warmup skipped', stdout.getvalue())

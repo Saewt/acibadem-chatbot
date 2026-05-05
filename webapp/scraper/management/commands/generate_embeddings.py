@@ -11,7 +11,7 @@ DEFAULT_FETCH_SIZE = 128
 
 
 class Command(BaseCommand):
-    help = 'Generate embeddings for ContentChunks using sentence-transformers'
+    help = 'Generate embeddings for ContentChunks using the configured embedding backend'
 
     def add_arguments(self, parser):
         parser.add_argument(

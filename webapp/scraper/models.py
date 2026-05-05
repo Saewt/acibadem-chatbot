@@ -53,3 +53,18 @@ class ContentChunk(models.Model):
                 fields=['page', 'chunk_index'], name='unique_chunk_per_page_position'
             )
         ]
+
+
+class KnowledgeSyncState(models.Model):
+    key = models.CharField(max_length=100, unique=True)
+    last_checked_at = models.DateTimeField(null=True, blank=True)
+    last_success_at = models.DateTimeField(null=True, blank=True)
+    last_manifest_hash = models.CharField(max_length=64, blank=True)
+    last_status = models.CharField(max_length=20, default='idle')
+    last_error = models.TextField(blank=True)
+
+    def __str__(self):
+        return self.key
+
+    class Meta:
+        ordering = ['key']

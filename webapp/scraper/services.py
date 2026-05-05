@@ -14,7 +14,6 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
-from .embeddings import iter_text_embedding_batches
 from .models import ContentChunk, WebPage
 
 logger = logging.getLogger(__name__)
@@ -1570,6 +1569,9 @@ def build_chunk_embedding_text(text: str, metadata: dict) -> str:
         ('Program', 'program_title'),
         ('Yerlesim', 'placement_label'),
         ('Fakulte', 'faculty'),
+        ('MufredatYili', 'curriculum_year'),
+        ('Donem', 'period_label'),
+        ('KayitTuru', 'record_type'),
         ('Konu', 'topic_label'),
         ('Bolum', 'section_title'),
         ('Baslik', 'page_title'),
@@ -1584,7 +1586,38 @@ def build_chunk_embedding_text(text: str, metadata: dict) -> str:
     return '\n'.join(lines)
 
 
-def upsert_page_content(
+def _normalize_prebuilt_chunks(chunks: list[dict] | None) -> list[dict]:
+    normalized_chunks: list[dict] = []
+    for index, chunk in enumerate(chunks or []):
+        text = normalize_whitespace(chunk.get('text', ''))
+        if not text:
+            continue
+        normalized_chunks.append(
+            {
+                'text': text,
+                'metadata': dict(chunk.get('metadata') or {}),
+                'chunk_index': int(chunk.get('chunk_index', index)),
+            }
+        )
+    return normalized_chunks
+
+
+def _build_page_content_hash(normalized_text: str, normalized_chunks: list[dict]) -> str:
+    payload = {
+        'text': normalized_text,
+        'chunks': [
+            {
+                'chunk_index': chunk['chunk_index'],
+                'text': chunk['text'],
+                'metadata': chunk['metadata'],
+            }
+            for chunk in normalized_chunks
+        ],
+    }
+    return hash_content(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def upsert_page_chunks(
     *,
     source: str,
     url: str,
@@ -1592,16 +1625,18 @@ def upsert_page_content(
     text: str,
     raw_html: str,
     metadata: dict,
+    chunks: list[dict],
     language: str = 'tr',
     force_refresh: bool = False,
 ) -> tuple[WebPage, bool]:
-    # Playwright's sync API keeps an event loop active in the current process.
-    # These management commands are still fully synchronous, so allow ORM calls.
     os.environ.setdefault('DJANGO_ALLOW_ASYNC_UNSAFE', 'true')
     normalized_title = normalize_page_title(title)
     normalized_text = normalize_whitespace(text)
-    content_hash = hash_content(normalized_text)
-    chunk_page_metadata = {'page_title': normalized_title, 'source': source, **metadata}
+    normalized_chunks = _normalize_prebuilt_chunks(chunks)
+    chunk_page_metadata = {'page_title': normalized_title, 'source': source, **(metadata or {})}
+    for chunk in normalized_chunks:
+        chunk['metadata'] = {**chunk_page_metadata, **chunk['metadata']}
+    content_hash = _build_page_content_hash(normalized_text, normalized_chunks)
     page, created = WebPage.objects.get_or_create(
         url=url,
         defaults={
@@ -1626,44 +1661,52 @@ def upsert_page_content(
     page.is_active = True
     page.save()
     if changed:
-        logger.debug(
-            'upsert_page_content changed url=%s source=%s created=%s force_refresh=%s',
-            url,
-            source,
-            created,
-            force_refresh,
-        )
         page.chunks.all().delete()
-        chunk_rows = [
-            ContentChunk(
-                page=page,
-                chunk_index=index,
-                text=chunk['text'],
-                metadata={
-                    **chunk['metadata'],
-                    **chunk_page_metadata,
-                },
-            )
-            for index, chunk in enumerate(chunk_text(normalized_text))
-        ]
-        texts = [build_chunk_embedding_text(chunk.text, chunk.metadata) for chunk in chunk_rows]
-        for start, vectors in iter_text_embedding_batches(texts):
-            batch_rows = chunk_rows[start : start + len(vectors)]
-            for chunk, vector in zip(batch_rows, vectors, strict=True):
-                chunk.embedding = vector
-        ContentChunk.objects.bulk_create(chunk_rows)
-    else:
-        stale_chunks = list(page.chunks.exclude(metadata__contains=chunk_page_metadata))
-        for chunk in stale_chunks:
-            chunk.metadata = {**chunk.metadata, **chunk_page_metadata}
-        if stale_chunks:
-            logger.debug(
-                'upsert_page_content metadata_sync url=%s chunks=%s',
-                url,
-                len(stale_chunks),
-            )
-            ContentChunk.objects.bulk_update(stale_chunks, ['metadata'])
+        ContentChunk.objects.bulk_create(
+            [
+                ContentChunk(
+                    page=page,
+                    chunk_index=chunk['chunk_index'],
+                    text=chunk['text'],
+                    metadata=chunk['metadata'],
+                )
+                for chunk in normalized_chunks
+            ]
+        )
     return page, changed
+
+
+def upsert_page_content(
+    *,
+    source: str,
+    url: str,
+    title: str,
+    text: str,
+    raw_html: str,
+    metadata: dict,
+    language: str = 'tr',
+    force_refresh: bool = False,
+) -> tuple[WebPage, bool]:
+    normalized_text = normalize_whitespace(text)
+    normalized_chunks = [
+        {
+            'text': chunk['text'],
+            'metadata': chunk['metadata'],
+            'chunk_index': index,
+        }
+        for index, chunk in enumerate(chunk_text(normalized_text))
+    ]
+    return upsert_page_chunks(
+        source=source,
+        url=url,
+        title=title,
+        text=normalized_text,
+        raw_html=raw_html,
+        metadata=metadata,
+        chunks=normalized_chunks,
+        language=language,
+        force_refresh=force_refresh,
+    )
 
 
 def mark_missing_pages_inactive(source: str, seen_urls: Iterable[str]) -> int:

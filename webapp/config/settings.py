@@ -7,6 +7,14 @@ SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-change-me')
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 ALLOWED_HOSTS = ['*']
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -91,16 +99,45 @@ MODEL_RUNNER_HOST = os.environ.get(
     'MODEL_RUNNER_HOST', 'http://model-runner.docker.internal'
 ).rstrip('/')
 MODEL_RUNNER_BASE_URL = f'{MODEL_RUNNER_HOST}/engines/v1'
-LLM_MODEL = os.environ.get('LLM_MODEL', 'ai/qwen3:4B-UD-Q4_K_XL')
+LLM_MODEL = os.environ.get('LLM_MODEL', 'docker.io/qwen3:4B-UD-Q4_K_XL')
+LLM_WARMUP_ENABLED = _env_bool('LLM_WARMUP_ENABLED', False)
+LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', '160'))
+LLM_TIMEOUT = float(os.environ.get('LLM_TIMEOUT', '60'))
+LLM_MAX_CONCURRENT_REQUESTS = max(
+    int(os.environ.get('LLM_MAX_CONCURRENT_REQUESTS', '1')),
+    1,
+)
+LLM_QUEUE_TIMEOUT = max(float(os.environ.get('LLM_QUEUE_TIMEOUT', '0')), 0.0)
 EMBEDDING_MODEL = os.environ.get(
     'EMBEDDING_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'
 )
+EMBEDDING_BACKEND = os.environ.get('EMBEDDING_BACKEND', 'local')  # local | api
+EMBEDDING_API_URL = os.environ.get(
+    'EMBEDDING_API_URL', 'http://host.docker.internal:8001'
+)
+EMBEDDING_API_TIMEOUT = int(os.environ.get('EMBEDDING_API_TIMEOUT', '30'))
+EMBEDDING_BATCH_SIZE = int(os.environ.get('EMBEDDING_BATCH_SIZE', '2'))
 CACHE_TTL = int(os.environ.get('CACHE_TTL', '3600'))
-RAG_RETRIEVE_LIMIT = int(os.environ.get('RAG_RETRIEVE_LIMIT', '6'))
-RAG_PER_PAGE_LIMIT = int(os.environ.get('RAG_PER_PAGE_LIMIT', '3'))
-RAG_MAX_CHUNK_CHARS = int(os.environ.get('RAG_MAX_CHUNK_CHARS', '700'))
-RAG_MAX_CONTEXT_CHARS = int(os.environ.get('RAG_MAX_CONTEXT_CHARS', '4000'))
+RAG_RETRIEVE_LIMIT = int(os.environ.get('RAG_RETRIEVE_LIMIT', '3'))
+RAG_PER_PAGE_LIMIT = int(os.environ.get('RAG_PER_PAGE_LIMIT', '1'))
+RAG_MAX_CHUNK_CHARS = int(os.environ.get('RAG_MAX_CHUNK_CHARS', '500'))
+RAG_MAX_CONTEXT_CHARS = int(os.environ.get('RAG_MAX_CONTEXT_CHARS', '1800'))
 CHAT_WARMUP_ENABLED = os.environ.get('CHAT_WARMUP_ENABLED', 'True') == 'True'
+ACIBADEM_DATASET_ROOT = os.environ.get(
+    'ACIBADEM_DATASET_ROOT',
+    str(BASE_DIR.parent.parent / 'scraping'),
+)
+KNOWLEDGE_BOOTSTRAP_ENABLED = os.environ.get('KNOWLEDGE_BOOTSTRAP_ENABLED', 'True') == 'True'
+KNOWLEDGE_BOOTSTRAP_FAIL_ON_MISSING_DATA = (
+    os.environ.get('KNOWLEDGE_BOOTSTRAP_FAIL_ON_MISSING_DATA', 'True') == 'True'
+)
+KNOWLEDGE_SYNC_KEY = os.environ.get('KNOWLEDGE_SYNC_KEY', 'acibadem_knowledge')
+KNOWLEDGE_SYNC_ENABLED = os.environ.get('KNOWLEDGE_SYNC_ENABLED', 'False') == 'True'
+KNOWLEDGE_SYNC_RUN_ON_START = _env_bool('KNOWLEDGE_SYNC_RUN_ON_START', False)
+KNOWLEDGE_SYNC_INTERVAL_HOURS = int(os.environ.get('KNOWLEDGE_SYNC_INTERVAL_HOURS', '168'))
+KNOWLEDGE_SCHEDULER_POLL_SECONDS = int(
+    os.environ.get('KNOWLEDGE_SCHEDULER_POLL_SECONDS', '300')
+)
 
 LOGGING = {
     'version': 1,

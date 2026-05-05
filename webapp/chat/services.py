@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import unicodedata
 from collections.abc import Iterator
 from time import perf_counter
@@ -10,6 +11,7 @@ from django.conf import settings
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
 from django.core.cache import cache
 from django.db import transaction
+from django.db.models import Q
 from openai import OpenAI
 from pgvector.django import CosineDistance
 
@@ -23,23 +25,47 @@ NO_CONTEXT_ANSWER = (
     'Bu konuda doğrulanmış üniversite kaynağı bulamadım. '
     'İstersen soruyu daha spesifik sorabilir veya başka bir resmi sayfayı hedefleyebilirsin.'
 )
+LLM_BUSY_ANSWER = (
+    'Model şu anda başka bir yanıt üretiyor. '
+    'Lütfen birkaç saniye sonra tekrar deneyin.'
+)
 QUESTION_HASH_LENGTH = 12
-CACHE_KEY_VERSION = 'v3'
+CACHE_KEY_VERSION = 'v7'
 CANDIDATE_LIMIT_MULTIPLIER = 3
 SSE_DONE_SENTINEL = '[DONE]'
 STAFF_QUERY_PATTERN = re.compile(
     r'\b('
     r'hoca\w*|'
+    r'hocası\w*|'
     r'akademik\s*kadro\w*|'
+    r'akademik\s*personel\w*|'
     r'öğretim\s*üye\w*|'
     r'ogretim\s*uye\w*|'
+    r'öğretim\s*görevli\w*|'
+    r'ogretim\s*gorevli\w*|'
+    r'personel\w*|'
     r'profesör\w*|'
     r'profesor\w*|'
-    r'kimler|'
-    r'listele\w*|'
-    r'kaç|'
-    r'kac'
+    r'başkan\w*|'
+    r'baskan\w*|'
+    r'dekan\w*|'
+    r'müdür\w*|'
+    r'mudur\w*|'
+    r'yönetim\w*|'
+    r'yonetim\w*|'
+    r'görevli\w*|'
+    r'gorevli\w*|'
+    r'yetkili\w*'
     r')\b'
+)
+STAFF_COUNT_QUERY_PATTERN = re.compile(
+    r'\b(kaç|kac|ne\s*kadar|say[ıi]s[ıi]|adet|tane)\b'
+)
+PROGRAM_EXISTS_QUERY_PATTERN = re.compile(
+    r'\b(var\s*m[ıi]|bulunuyor\s*mu|mevcut\s*mu|aç[ıi]k\s*m[ıi])\b'
+)
+DENTISTRY_QUERY_PATTERN = re.compile(
+    r'\b(dişçilik|discilik|diş\s*hekimliği|dis\s*hekimligi)\b'
 )
 SCORE_QUERY_PATTERN = re.compile(
     r'\b('
@@ -76,17 +102,91 @@ RANK_QUERY_PATTERN = re.compile(
 )
 POINTS_QUERY_PATTERN = re.compile(r'\b(puan\w*|taban\s*puan\w*|tavan\s*puan\w*)\b')
 QUOTA_QUERY_PATTERN = re.compile(r'\b(kontenjan\w*)\b')
+COURSE_QUERY_PATTERN = re.compile(
+    r'\b('
+    r'ders\w*|'
+    r'müfredat\w*|'
+    r'mufredat\w*|'
+    r'yarıyıl\w*|'
+    r'yariyil\w*|'
+    r'akts\w*|'
+    r'ects\w*|'
+    r'semester\w*'
+    r')\b'
+)
+TOPIC_KEYWORDS = {
+    'scholarships': (
+        'burs',
+        'scholarship',
+    ),
+    'dormitory': (
+        'yurt',
+        'depozito',
+        'konaklama',
+        'dorm',
+    ),
+    'international': (
+        'erasmus',
+        'uluslararası',
+        'uluslararasi',
+        'hareketlilik',
+        'yurtdış',
+        'yurtdis',
+        'değişim',
+        'degisim',
+    ),
+    'double_major_minor': (
+        'çift anadal',
+        'cift anadal',
+        'yandal',
+        'çap',
+        'cap',
+        'minor',
+        'major',
+    ),
+}
 
 
 class ConversationNotFoundError(Exception):
     pass
 
 
+class LLMBusyError(RuntimeError):
+    pass
+
+
+_LLM_SEMAPHORE_LOCK = threading.Lock()
+_LLM_SEMAPHORE: threading.BoundedSemaphore | None = None
+_LLM_SEMAPHORE_LIMIT: int | None = None
+
+
+def _get_llm_semaphore() -> threading.BoundedSemaphore:
+    global _LLM_SEMAPHORE, _LLM_SEMAPHORE_LIMIT
+    limit = max(int(settings.LLM_MAX_CONCURRENT_REQUESTS), 1)
+    with _LLM_SEMAPHORE_LOCK:
+        if _LLM_SEMAPHORE is None or _LLM_SEMAPHORE_LIMIT != limit:
+            _LLM_SEMAPHORE = threading.BoundedSemaphore(limit)
+            _LLM_SEMAPHORE_LIMIT = limit
+        return _LLM_SEMAPHORE
+
+
+def _acquire_llm_slot() -> threading.BoundedSemaphore:
+    semaphore = _get_llm_semaphore()
+    queue_timeout = max(float(settings.LLM_QUEUE_TIMEOUT), 0.0)
+    if queue_timeout:
+        acquired = semaphore.acquire(timeout=queue_timeout)
+    else:
+        acquired = semaphore.acquire(blocking=False)
+    if not acquired:
+        raise LLMBusyError('llm request limit reached')
+    return semaphore
+
+
 def get_llm_client() -> OpenAI:
     return OpenAI(
         base_url=settings.MODEL_RUNNER_BASE_URL,
         api_key=getattr(settings, 'MODEL_RUNNER_API_KEY', 'not-needed'),
-        timeout=120.0,
+        timeout=settings.LLM_TIMEOUT,
     )
 
 
@@ -135,6 +235,26 @@ def _get_chunk_metadata_value(chunk: ContentChunk, key: str) -> str:
     return _get_metadata_value(chunk.metadata, key) or _get_metadata_value(chunk.page.metadata, key)
 
 
+def _clean_display_text(value: str) -> str:
+    value = ' '.join(str(value or '').split())
+    value = re.sub(r'\*+', '', value)
+    return value.strip()
+
+
+def _clean_note_text(value: str) -> str:
+    value = _clean_display_text(value)
+    value = re.sub(r'\s*Burs hakkında bilgi almak için tıklayın\.?', '', value)
+    return value.strip()
+
+
+def _normalized_contains(text: str, needle: str) -> bool:
+    normalized_text = _normalize_lookup_text(text)
+    normalized_needle = _normalize_lookup_text(needle)
+    if not normalized_text or not normalized_needle:
+        return False
+    return bool(re.search(rf'(^|\s){re.escape(normalized_needle)}($|\s)', normalized_text))
+
+
 def _build_scope_aliases(value: str) -> set[str]:
     aliases: set[str] = set()
     for raw_value in str(value or '').split('|'):
@@ -160,13 +280,14 @@ def _build_question_hint_aliases(value: str) -> set[str]:
 
 
 def _clean_scope_hint_value(value: str) -> str:
+    stop_words = {'kaç', 'kac', 'tane', 'adet', 'sayısı', 'sayisi', 'ne', 'kadar'}
     tokens = [
         token
         for token in _normalize_lookup_text(value).split()
-        if token and token not in {'kaç', 'kac'}
+        if token and token not in stop_words
     ]
     if not tokens:
-        return value
+        return ''
 
     suffixes = ('nde', 'nda', 'de', 'da', 'den', 'dan', 'nin', 'nın', 'nun', 'nün')
     last_token = tokens[-1]
@@ -207,6 +328,99 @@ def _question_mentions_alias(question: str, alias: str) -> bool:
     return bool(re.search(rf'(^|\s){re.escape(alias)}($|\s)', question))
 
 
+def _known_program_candidates() -> list[str]:
+    candidates: set[str] = set()
+    metadata_fields = ('program_title', 'unit_name', 'placement_label')
+    for field in metadata_fields:
+        values = (
+            ContentChunk.objects.filter(page__is_active=True)
+            .exclude(**{f'metadata__{field}': ''})
+            .values_list(f'metadata__{field}', flat=True)
+            .distinct()
+        )
+        candidates.update(_clean_display_text(value) for value in values if value)
+
+    page_titles = (
+        ContentChunk.objects.filter(page__is_active=True)
+        .values_list('page__title', flat=True)
+        .distinct()
+    )
+    for title in page_titles:
+        title = _clean_display_text(title)
+        if ' - ' in title:
+            candidates.add(title.split(' - ', 1)[0].strip())
+
+    return sorted(
+        {candidate for candidate in candidates if len(_normalize_lookup_text(candidate)) > 2},
+        key=lambda value: len(_normalize_lookup_text(value)),
+        reverse=True,
+    )
+
+
+def _extract_known_program_from_text(text: str) -> str:
+    normalized_text = _normalize_lookup_text(text)
+    if not normalized_text:
+        return ''
+    for candidate in _known_program_candidates():
+        for alias in _build_scope_aliases(candidate):
+            if _question_mentions_alias(normalized_text, alias):
+                return _clean_display_text(candidate)
+    return ''
+
+
+def _extract_program_hint_from_text(text: str) -> str:
+    for field, aliases in _extract_question_scope_hints(text):
+        if field == 'program_title' and aliases:
+            return max(aliases, key=len)
+    return ''
+
+
+def _program_lookup_terms(program_title: str) -> set[str]:
+    terms = {_clean_display_text(program_title)}
+    for alias in _build_scope_aliases(program_title):
+        if alias:
+            terms.add(alias)
+    return {term for term in terms if term}
+
+
+def _question_has_explicit_scope(question: str) -> bool:
+    if _is_dentistry_query(question):
+        return True
+    if _extract_question_scope_hints(question):
+        return True
+    return bool(_extract_known_program_from_text(question))
+
+
+def _is_followup_question(question: str) -> bool:
+    normalized_question = _normalize_lookup_text(question)
+    tokens = normalized_question.split()
+    if len(tokens) <= 6 and any(
+        token in normalized_question
+        for token in ('hocası', 'hocaları', 'ücreti', 'puanı', 'kontenjanı', 'var mı')
+    ):
+        return True
+    return bool(re.search(r'\b(bunun|onun|programın|bölümün|bolumun)\b', normalized_question))
+
+
+def _resolve_question_with_conversation(question: str, conversation: Conversation) -> str:
+    if _question_has_explicit_scope(question) or not _is_followup_question(question):
+        return question
+
+    previous_user_messages = (
+        conversation.messages.filter(role='user')
+        .order_by('-created_at')
+        .values_list('content', flat=True)[:8]
+    )
+    for previous_question in previous_user_messages:
+        program_title = (
+            _extract_known_program_from_text(previous_question)
+            or _extract_program_hint_from_text(previous_question)
+        )
+        if program_title:
+            return f'{program_title} {question}'
+    return question
+
+
 def _dedupe_chunks(chunks: list[ContentChunk]) -> list[ContentChunk]:
     selected: list[ContentChunk] = []
     seen_chunk_ids: set[int] = set()
@@ -237,6 +451,16 @@ def _limit_chunks(
     return selected
 
 
+_SCOPE_STOP_WORDS = frozenset({
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12',
+    'sınıf', 'sınıfın', 'sınıfta', 'yarıyıl', 'ders', 'dersler', 'dersleri',
+    'var', 'hangileri', 'nedir', 'kaç', 'kim', 'kimdir', 'hoca',
+    'müfredat', 'planı', 'plan', 'akts', 'ects', 'zorunlu', 'seçmeli',
+    've', 'veya', 'ile', 'için', 'hakkında', 'nerede', 'nasıl',
+    'listele', 'ver', 'bul', 'göster', 'bölüm', 'fakülte', 'program',
+})
+
+
 def _build_scope_constraint(question: str, chunks: list[ContentChunk]) -> dict | None:
     normalized_question = _normalize_lookup_text(question)
     if not normalized_question:
@@ -261,6 +485,21 @@ def _build_scope_constraint(question: str, chunks: list[ContentChunk]) -> dict |
                 'field': field,
                 'aliases': {alias for alias in aliases if len(alias) == longest_alias_length},
             }
+
+    # Fallback: match distinctive question tokens against chunk metadata
+    question_tokens = normalized_question.split()
+    distinctive = [t for t in question_tokens if t not in _SCOPE_STOP_WORDS and len(t) > 2]
+    for token in distinctive:
+        for field in ('program_title', 'faculty'):
+            matching_aliases: set[str] = set()
+            for chunk in chunks:
+                value = _get_chunk_metadata_value(chunk, field)
+                normalized_value = _normalize_lookup_text(value)
+                if re.search(rf'(^|\s){re.escape(token)}($|\s)', normalized_value):
+                    matching_aliases.update(_build_scope_aliases(value))
+            if matching_aliases:
+                return {'field': field, 'aliases': matching_aliases}
+
     return None
 
 
@@ -301,6 +540,24 @@ def _is_staff_query(question: str) -> bool:
     return bool(STAFF_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
 
+def _is_staff_count_query(question: str) -> bool:
+    normalized_question = _normalize_lookup_text(question)
+    return _is_staff_query(question) and bool(STAFF_COUNT_QUERY_PATTERN.search(normalized_question))
+
+
+def _is_staff_list_query(question: str) -> bool:
+    normalized_question = _normalize_lookup_text(question)
+    return bool(re.search(r'\b(kimler|listele\w*|adlar[ıi]|isimler[ıi])\b', normalized_question))
+
+
+def _is_program_exists_query(question: str) -> bool:
+    return bool(PROGRAM_EXISTS_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
+def _is_dentistry_query(question: str) -> bool:
+    return bool(DENTISTRY_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
 def _is_score_query(question: str) -> bool:
     return bool(SCORE_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
@@ -321,6 +578,10 @@ def _is_quota_query(question: str) -> bool:
     return bool(QUOTA_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
 
+def _is_course_query(question: str) -> bool:
+    return bool(COURSE_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
 def _question_topics(question: str) -> set[str]:
     normalized_question = _normalize_lookup_text(question)
     topics: set[str] = set()
@@ -335,8 +596,36 @@ def _question_topics(question: str) -> set[str]:
     return topics
 
 
+def _chunk_matches_question_topic(question_topics: set[str], chunk: ContentChunk) -> bool:
+    if not question_topics:
+        return False
+
+    topic = _get_chunk_metadata_value(chunk, 'topic')
+    if topic in question_topics:
+        return True
+
+    searchable_text = _normalize_lookup_text(
+        ' '.join(
+            [
+                chunk.page.title,
+                _get_chunk_metadata_value(chunk, 'topic_label'),
+                _get_chunk_metadata_value(chunk, 'section_title'),
+                _get_chunk_metadata_value(chunk, 'source_url'),
+                chunk.text[:1000],
+            ]
+        )
+    )
+    for question_topic in question_topics:
+        for keyword in TOPIC_KEYWORDS.get(question_topic, ()):
+            if _normalize_lookup_text(keyword) in searchable_text:
+                return True
+    return False
+
+
 def _chunk_priority(question: str, chunk: ContentChunk) -> int:
     kind = _get_chunk_metadata_value(chunk, 'kind')
+    record_type = _get_chunk_metadata_value(chunk, 'record_type')
+    chunk_level = _get_chunk_metadata_value(chunk, 'chunk_level')
     staff_page_type = _get_chunk_metadata_value(chunk, 'staff_page_type')
     topic = _get_chunk_metadata_value(chunk, 'topic')
     staff_count_text = _get_chunk_metadata_value(chunk, 'staff_count')
@@ -346,6 +635,10 @@ def _chunk_priority(question: str, chunk: ContentChunk) -> int:
         staff_count = 0
 
     if _is_staff_query(question):
+        if record_type == 'academic_staff_member':
+            return 0
+        if record_type == 'department_head_message':
+            return 0
         if kind == 'bologna_staff_page':
             if staff_page_type == 'academic_staff' and staff_count > 1:
                 return 0
@@ -359,26 +652,35 @@ def _chunk_priority(question: str, chunk: ContentChunk) -> int:
         return 5
 
     if _is_score_query(question):
-        if kind == 'structured_admissions_score':
+        if kind == 'structured_admissions_score' or record_type == 'quota_row':
             return 0
         if kind == 'candidate_topic_page' and topic == 'admissions_scores':
             return 1
-        if kind == 'structured_admissions_fee':
+        if kind == 'structured_admissions_fee' or record_type == 'tuition_fee':
             return 4
         return 5
 
     if _is_fee_query(question):
-        if kind == 'structured_admissions_fee':
+        if kind == 'structured_admissions_fee' or record_type == 'tuition_fee':
             return 0
         if kind == 'candidate_topic_page' and topic == 'tuition':
             return 1
-        if kind == 'structured_admissions_score':
+        if kind == 'structured_admissions_score' or record_type == 'quota_row':
             return 4
+        return 5
+
+    if _is_course_query(question):
+        if chunk_level == 'semester_plan':
+            return 0
+        if chunk_level == 'program_overview':
+            return 1
+        if kind == 'bologna_program_page':
+            return 2
         return 5
 
     question_topics = _question_topics(question)
     if question_topics:
-        if kind == 'candidate_topic_page' and topic in question_topics:
+        if _chunk_matches_question_topic(question_topics, chunk):
             return 0
         return 5
 
@@ -397,11 +699,22 @@ def _sort_candidate_chunks(question: str, chunks: list[ContentChunk]) -> list[Co
 
 
 def _filter_candidates_for_query(question: str, chunks: list[ContentChunk]) -> list[ContentChunk]:
+    if _is_staff_query(question):
+        staff_chunks = [
+            chunk
+            for chunk in chunks
+            if _get_chunk_metadata_value(chunk, 'kind') in {'bologna_staff_page', 'main_site_staff_page'}
+            or _get_chunk_metadata_value(chunk, 'record_type') in {'academic_staff_member', 'department_head_message'}
+        ]
+        if staff_chunks:
+            return staff_chunks
+
     if _is_score_query(question):
         return [
             chunk
             for chunk in chunks
             if _get_chunk_metadata_value(chunk, 'kind') == 'structured_admissions_score'
+            or _get_chunk_metadata_value(chunk, 'record_type') == 'quota_row'
             or (
                 _get_chunk_metadata_value(chunk, 'kind') == 'candidate_topic_page'
                 and _get_chunk_metadata_value(chunk, 'topic') == 'admissions_scores'
@@ -413,10 +726,31 @@ def _filter_candidates_for_query(question: str, chunks: list[ContentChunk]) -> l
             chunk
             for chunk in chunks
             if _get_chunk_metadata_value(chunk, 'kind') == 'structured_admissions_fee'
+            or _get_chunk_metadata_value(chunk, 'record_type') == 'tuition_fee'
             or (
                 _get_chunk_metadata_value(chunk, 'kind') == 'candidate_topic_page'
                 and _get_chunk_metadata_value(chunk, 'topic') == 'tuition'
             )
+        ]
+
+    if _is_course_query(question):
+        filtered = [
+            chunk
+            for chunk in chunks
+            if _get_chunk_metadata_value(chunk, 'chunk_level') in {'semester_plan', 'program_overview'}
+            or chunk.page.source == 'bologna'
+            or _get_chunk_metadata_value(chunk, 'curriculum_year')
+            or _get_chunk_metadata_value(chunk, 'period_label')
+        ]
+        if filtered:
+            return filtered
+
+    question_topics = _question_topics(question)
+    if question_topics:
+        return [
+            chunk
+            for chunk in chunks
+            if _chunk_matches_question_topic(question_topics, chunk)
         ]
 
     return chunks
@@ -433,8 +767,20 @@ def _question_specific_prompt_rules(question: str) -> list[str]:
                 'Bir yerleşim tipinde istenen alan eksikse sadece o yerleşim tipi için bilginin kaynakta yer almadığını belirt.',
             ]
         )
+    elif _is_staff_query(question):
+        rules.extend(
+            [
+                'Akademik kadro ve yönetici sorularında yalnızca personel kaynaklarını kullan.',
+                'Bölüm başkanı, dekan veya müdür sorularında "Program Yetkilileri" ve "Akademik Kadro" kaynaklarını önceliklendir.',
+                'Bir kişinin görevini belirtirken kaynakta geçtiği gibi yaz.',
+            ]
+        )
     elif _is_fee_query(question):
         rules.append('Ücret sorularında yalnızca resmi öğrenim ücreti veya ilgili aday öğrenci kaynaklarını kullan.')
+    elif _is_course_query(question):
+        rules.append('Ders planı ve AKTS sorularında öncelikle müfredat yılı ve dönem metadata bilgilerini dikkate al.')
+    elif _question_topics(question):
+        rules.append('Burs, yurt, Erasmus, uluslararası olanak veya ÇAP-yandal sorularında yalnızca ilgili konu kaynaklarını kullan.')
     return rules
 
 
@@ -468,7 +814,7 @@ def _build_structured_score_answer(question: str, chunks: list[ContentChunk]) ->
         return priority, _get_chunk_metadata_value(chunk, 'placement_label') or chunk.page.title
 
     program_titles = {
-        _get_chunk_metadata_value(chunk, 'program_title')
+        _clean_display_text(_get_chunk_metadata_value(chunk, 'program_title'))
         for chunk in score_chunks
         if _get_chunk_metadata_value(chunk, 'program_title')
     }
@@ -482,6 +828,7 @@ def _build_structured_score_answer(question: str, chunks: list[ContentChunk]) ->
         placement = _get_chunk_metadata_value(chunk, 'placement_label') or _get_chunk_metadata_value(
             chunk, 'program_title'
         ) or chunk.page.title
+        placement = _clean_display_text(placement)
         base_rank = _get_chunk_metadata_value(chunk, 'base_rank')
         base_score = _get_chunk_metadata_value(chunk, 'base_score')
         quota = _get_chunk_metadata_value(chunk, 'quota')
@@ -522,6 +869,205 @@ def _build_structured_score_answer(question: str, chunks: list[ContentChunk]) ->
     return '\n'.join(lines)
 
 
+def _build_structured_fee_answer(question: str, chunks: list[ContentChunk]) -> str:
+    if not _is_fee_query(question):
+        return ''
+
+    fee_chunks = [
+        chunk
+        for chunk in chunks
+        if _get_chunk_metadata_value(chunk, 'kind') == 'structured_admissions_fee'
+        or _get_chunk_metadata_value(chunk, 'record_type') == 'tuition_fee'
+    ]
+    if not fee_chunks:
+        return ''
+
+    program_titles = {
+        _clean_display_text(_get_chunk_metadata_value(chunk, 'program_title'))
+        for chunk in fee_chunks
+        if _get_chunk_metadata_value(chunk, 'program_title')
+    }
+    if len(program_titles) == 1:
+        intro = f'{next(iter(program_titles))} için resmi öğrenim ücreti bilgileri:'
+    else:
+        intro = 'Resmi öğrenim ücreti bilgileri:'
+
+    lines = [intro]
+    for chunk in sorted(
+        fee_chunks,
+        key=lambda item: (
+            _get_chunk_metadata_value(item, 'program_title') or item.page.title,
+            item.page.title,
+        ),
+    ):
+        label = _get_chunk_metadata_value(chunk, 'program_title') or chunk.page.title
+        metrics: list[str] = []
+        for title, key in (
+            ('ücretli', 'fee_full'),
+            ('%25 indirimli', 'fee_25'),
+            ('%50 indirimli', 'fee_50'),
+            ('ilave %25 KAV destek burslu', 'fee_kav_support'),
+        ):
+            value = _get_chunk_metadata_value(chunk, key)
+            if value:
+                metrics.append(f'{title} {value}')
+        notes = _get_chunk_metadata_value(chunk, 'notes')
+        if notes:
+            cleaned_notes = _clean_note_text(notes)
+            if cleaned_notes:
+                metrics.append(f'notlar: {cleaned_notes}')
+        if not metrics:
+            metrics.append('ücret bilgisi kaynakta yer almıyor')
+        lines.append(f'- {_clean_display_text(label)}: {", ".join(metrics)}.')
+    return '\n'.join(lines)
+
+
+def _staff_member_chunks_for_context(chunks: list[ContentChunk]) -> list[ContentChunk]:
+    staff_page_ids = {
+        chunk.page_id
+        for chunk in chunks
+        if _get_chunk_metadata_value(chunk, 'kind') in {'main_site_staff_page', 'bologna_staff_page'}
+        or _get_chunk_metadata_value(chunk, 'record_type') == 'academic_staff_member'
+    }
+    if not staff_page_ids:
+        return []
+
+    return list(
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True, page_id__in=staff_page_ids)
+        .filter(metadata__record_type='academic_staff_member')
+        .order_by('page_id', 'chunk_index')
+    )
+
+
+def _staff_program_title(chunk: ContentChunk) -> str:
+    program_title = (
+        _get_chunk_metadata_value(chunk, 'program_title')
+        or _get_chunk_metadata_value(chunk, 'unit_name')
+        or chunk.page.title.split(' - ', 1)[0]
+    )
+    return _clean_display_text(program_title)
+
+
+def _build_structured_staff_answer(question: str, chunks: list[ContentChunk]) -> str:
+    if not _is_staff_query(question):
+        return ''
+
+    staff_chunks = _staff_member_chunks_for_context(chunks)
+    if not staff_chunks:
+        staff_count_chunks = [
+            chunk
+            for chunk in chunks
+            if _get_chunk_metadata_value(chunk, 'staff_count')
+            and _get_chunk_metadata_value(chunk, 'kind') in {'main_site_staff_page', 'bologna_staff_page'}
+        ]
+        if not staff_count_chunks:
+            return ''
+        chunk = staff_count_chunks[0]
+        program_title = _staff_program_title(chunk)
+        staff_count = _get_chunk_metadata_value(chunk, 'staff_count')
+        return f'{program_title} akademik kadro kaynağında {staff_count} hoca kaydı görünüyor.'
+
+    unique_members: dict[str, tuple[str, str]] = {}
+    for chunk in staff_chunks:
+        name = _clean_display_text(_get_chunk_metadata_value(chunk, 'entity_name'))
+        if not name:
+            match = re.search(r'isim:\s*([^|]+)', chunk.text)
+            name = _clean_display_text(match.group(1)) if match else ''
+        if not name:
+            continue
+
+        title = _clean_display_text(
+            _get_chunk_metadata_value(chunk, 'staff_title')
+            or (re.search(r'unvan:\s*([^|]+)', chunk.text).group(1) if re.search(r'unvan:\s*([^|]+)', chunk.text) else '')
+        )
+        unique_members.setdefault(_normalize_lookup_text(name), (name, title))
+
+    if not unique_members:
+        return ''
+
+    first_chunk = staff_chunks[0]
+    program_title = _staff_program_title(first_chunk)
+    staff_count_text = _get_chunk_metadata_value(first_chunk, 'staff_count')
+    try:
+        staff_count = int(staff_count_text) if staff_count_text else len(unique_members)
+    except ValueError:
+        staff_count = len(unique_members)
+    staff_count = max(staff_count, len(unique_members))
+
+    if _is_staff_count_query(question) and not _is_staff_list_query(question):
+        return (
+            f'{program_title} akademik kadro kaynağında {staff_count} hoca kaydı var.'
+        )
+
+    lines = [f'{program_title} akademik kadro kaynağında {staff_count} hoca kaydı var:']
+    for name, title in unique_members.values():
+        label = f'{title} {name}'.strip() if title else name
+        lines.append(f'- {label}')
+    return '\n'.join(lines)
+
+
+def _build_program_presence_answer(question: str, chunks: list[ContentChunk]) -> str:
+    if not _is_program_exists_query(question):
+        return ''
+
+    if _is_dentistry_query(question):
+        has_dentistry = any(
+            _normalize_lookup_text(candidate) == 'diş hekimliği'
+            for candidate in _known_program_candidates()
+        )
+        oral_chunks = [
+            chunk
+            for chunk in chunks
+            if 'ağız ve diş sağlığı' in _normalize_lookup_text(
+                _get_chunk_metadata_value(chunk, 'program_title') or chunk.page.title
+            )
+        ]
+        if has_dentistry:
+            return 'Evet, indekslenmiş resmi kaynaklarda Diş Hekimliği programı görünüyor.'
+        if oral_chunks:
+            faculty = _get_chunk_metadata_value(oral_chunks[0], 'faculty')
+            level = _get_chunk_metadata_value(oral_chunks[0], 'admission_level')
+            level_text = 'ön lisans' if level == 'onlisans' else level
+            details = []
+            if level_text:
+                details.append(level_text)
+            if faculty:
+                details.append(faculty)
+            suffix = f" ({', '.join(details)})" if details else ''
+            return (
+                'İndekslenmiş resmi kaynaklarda Diş Hekimliği lisans programı bulamadım. '
+                f'Buna yakın fakat farklı bir program olarak Ağız ve Diş Sağlığı programı var{suffix}.'
+            )
+        return 'İndekslenmiş resmi kaynaklarda Diş Hekimliği programı bulamadım.'
+
+    program_title = _extract_known_program_from_text(question) or _extract_program_hint_from_text(question)
+    if not program_title:
+        return ''
+
+    matching_chunks = [
+        chunk
+        for chunk in chunks
+        if _normalized_contains(
+            _get_chunk_metadata_value(chunk, 'program_title') or chunk.page.title,
+            program_title,
+        )
+    ]
+    if not matching_chunks:
+        return ''
+
+    chunk = matching_chunks[0]
+    faculty = _get_chunk_metadata_value(chunk, 'faculty')
+    level = _get_chunk_metadata_value(chunk, 'admission_level')
+    details = []
+    if faculty:
+        details.append(faculty)
+    if level:
+        details.append('ön lisans' if level == 'onlisans' else level)
+    suffix = f" ({', '.join(details)})" if details else ''
+    return f'Evet, Acıbadem Üniversitesi resmi kaynaklarında {program_title} programı var{suffix}.'
+
+
 def retrieve_context(
     query_embedding: list[float], limit: int | None = None, per_page_limit: int | None = None
 ) -> list[ContentChunk]:
@@ -560,6 +1106,11 @@ def retrieve_keyword_context(
         + SearchVector('metadata__program_alias_text', config='simple')
         + SearchVector('metadata__placement_label', config='simple')
         + SearchVector('metadata__faculty', config='simple')
+        + SearchVector('metadata__entity_name', config='simple')
+        + SearchVector('metadata__record_type', config='simple')
+        + SearchVector('metadata__chunk_level', config='simple')
+        + SearchVector('metadata__curriculum_year', config='simple')
+        + SearchVector('metadata__period_label', config='simple')
         + SearchVector('metadata__topic_label', config='simple')
         + SearchVector('metadata__section_title', config='simple')
     )
@@ -600,6 +1151,8 @@ def _select_prompt_chunks(chunks: list[ContentChunk]) -> list[tuple[ContentChunk
                 f'Baslik: {chunk.page.title}',
                 f'Program: {_get_chunk_metadata_value(chunk, "program_title") or "-"}',
                 f'Fakulte: {_get_chunk_metadata_value(chunk, "faculty") or "-"}',
+                f'Mufredat Yili: {_get_chunk_metadata_value(chunk, "curriculum_year") or "-"}',
+                f'Donem: {_get_chunk_metadata_value(chunk, "period_label") or "-"}',
                 f'Bolum/Sayfa: {_get_chunk_metadata_value(chunk, "section_title") or chunk.page.title}',
                 f'URL: {_get_chunk_source_url(chunk)}',
                 f'Icerik: {excerpt}',
@@ -618,6 +1171,8 @@ def _select_prompt_chunks(chunks: list[ContentChunk]) -> list[tuple[ContentChunk
                     f'Baslik: {chunk.page.title}',
                     f'Program: {_get_chunk_metadata_value(chunk, "program_title") or "-"}',
                     f'Fakulte: {_get_chunk_metadata_value(chunk, "faculty") or "-"}',
+                    f'Mufredat Yili: {_get_chunk_metadata_value(chunk, "curriculum_year") or "-"}',
+                    f'Donem: {_get_chunk_metadata_value(chunk, "period_label") or "-"}',
                     f'Bolum/Sayfa: {_get_chunk_metadata_value(chunk, "section_title") or chunk.page.title}',
                     f'URL: {_get_chunk_source_url(chunk)}',
                     f'Icerik: {excerpt}',
@@ -645,6 +1200,8 @@ def build_prompt(question: str, chunks: list[ContentChunk]) -> tuple[str, list[C
                     f'Baslik: {chunk.page.title}',
                     f'Program: {_get_chunk_metadata_value(chunk, "program_title") or "-"}',
                     f'Fakulte: {_get_chunk_metadata_value(chunk, "faculty") or "-"}',
+                    f'Mufredat Yili: {_get_chunk_metadata_value(chunk, "curriculum_year") or "-"}',
+                    f'Donem: {_get_chunk_metadata_value(chunk, "period_label") or "-"}',
                     f'Bolum/Sayfa: {_get_chunk_metadata_value(chunk, "section_title") or chunk.page.title}',
                     f'URL: {_get_chunk_source_url(chunk)}',
                     f'Icerik: {excerpt}',
@@ -656,15 +1213,16 @@ def build_prompt(question: str, chunks: list[ContentChunk]) -> tuple[str, list[C
     additional_rules = _question_specific_prompt_rules(question)
     rules_block = ''.join(f'- {rule}\n' for rule in additional_rules) if additional_rules else ''
     prompt = (
-        'Sen Acibadem Universitesi icin resmi kaynaklardan cevap veren bir asistansin.\n'
-        'Yalnizca verilen baglama dayan.\n'
-        'Baglam yetmiyorsa bunu acikca soyle ve tahmin yapma.\n'
-        'Program veya fakulte odakli sorularda yalnizca metadata olarak eslesen kaynaklari kullan.\n'
-        'Cevabi Turkce ver.\n'
-        'Metin icinde kaynak numaralarini [1], [2] gibi kullan.\n\n'
+        'Sen Acıbadem Üniversitesi için resmi kaynaklardan cevap veren bir asistansın.\n'
+        'Yalnızca verilen bağlama dayan.\n'
+        'Bağlamda ilgili bilgi varsa bu bilgiden yararlanarak cevap ver, eksik kısımları belirt.\n'
+        'Bağlamda hiç ilgili bilgi yoksa bunu açıkça söyle.\n'
+        'Program veya fakülte odaklı sorularda yalnızca metadata olarak eşleşen kaynakları kullan.\n'
+        'Cevabı Türkçe ver.\n'
+        'Metin içinde kaynak numaralarını [1], [2] gibi kullan.\n\n'
         f'Ek kurallar:\n{rules_block}\n'
-        f'Baglam:\n{context}\n\n'
-        f'Kullanici sorusu: {question}'
+        f'Bağlam:\n{context}\n\n'
+        f'Kullanıcı sorusu: {question}'
     )
     return prompt, used_chunks
 
@@ -673,15 +1231,24 @@ def generate_answer(prompt: str) -> str:
     response = get_llm_client().chat.completions.create(
         model=settings.LLM_MODEL,
         temperature=0.1,
+        max_tokens=settings.LLM_MAX_TOKENS,
         messages=[
             {
                 'role': 'system',
-                'content': 'Resmi universite kaynagina dayali, kisa ve net cevaplar ver.',
+                'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
             },
             {'role': 'user', 'content': prompt},
         ],
     )
     return (response.choices[0].message.content or '').strip()
+
+
+def _generate_answer_with_slot(prompt: str) -> str:
+    semaphore = _acquire_llm_slot()
+    try:
+        return generate_answer(prompt)
+    finally:
+        semaphore.release()
 
 
 def _iter_delta_content_text(delta_content: object) -> Iterator[str]:
@@ -708,10 +1275,11 @@ def generate_answer_stream(prompt: str) -> Iterator[str]:
     stream = get_llm_client().chat.completions.create(
         model=settings.LLM_MODEL,
         temperature=0.1,
+        max_tokens=settings.LLM_MAX_TOKENS,
         messages=[
             {
                 'role': 'system',
-                'content': 'Resmi universite kaynagina dayali, kisa ve net cevaplar ver.',
+                'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
             },
             {'role': 'user', 'content': prompt},
         ],
@@ -722,6 +1290,14 @@ def generate_answer_stream(prompt: str) -> Iterator[str]:
             continue
         delta = chunk.choices[0].delta.content
         yield from _iter_delta_content_text(delta)
+
+
+def _generate_answer_stream_with_slot(prompt: str) -> Iterator[str]:
+    semaphore = _acquire_llm_slot()
+    try:
+        yield from generate_answer_stream(prompt)
+    finally:
+        semaphore.release()
 
 
 def build_sources(chunks: list[ContentChunk]) -> list[dict]:
@@ -766,6 +1342,68 @@ def _question_hash(question: str) -> str:
     return cache_key(question).rsplit(':', 1)[1][:QUESTION_HASH_LENGTH]
 
 
+def _retrieve_direct_staff_chunks(question: str, limit: int) -> list[ContentChunk]:
+    if not _is_staff_query(question):
+        return []
+
+    program_title = _extract_known_program_from_text(question) or _extract_program_hint_from_text(question)
+    if not program_title:
+        return []
+
+    program_lookup = Q()
+    for term in _program_lookup_terms(program_title):
+        program_lookup |= (
+            Q(metadata__program_title__icontains=term)
+            | Q(metadata__unit_name__icontains=term)
+            | Q(metadata__program_alias_text__icontains=term)
+            | Q(page__title__icontains=term)
+            | Q(text__icontains=term)
+        )
+
+    queryset = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(
+            Q(metadata__kind='main_site_staff_page')
+            | Q(metadata__kind='bologna_staff_page')
+            | Q(metadata__record_type='academic_staff_member')
+        )
+        .filter(program_lookup)
+        .order_by('page_id', 'chunk_index')
+    )
+    return list(queryset[:limit])
+
+
+def _retrieve_direct_program_chunks(question: str, limit: int) -> list[ContentChunk]:
+    if not _is_program_exists_query(question):
+        return []
+
+    if _is_dentistry_query(question):
+        lookups = Q(metadata__program_title__icontains='Ağız ve Diş Sağlığı') | Q(
+            page__title__icontains='Ağız ve Diş Sağlığı'
+        )
+    else:
+        program_title = _extract_known_program_from_text(question) or _extract_program_hint_from_text(question)
+        if not program_title:
+            return []
+        lookups = Q()
+        for term in _program_lookup_terms(program_title):
+            lookups |= (
+                Q(metadata__program_title__icontains=term)
+                | Q(metadata__program_alias_text__icontains=term)
+                | Q(page__title__icontains=term)
+                | Q(text__icontains=term)
+            )
+
+    queryset = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(lookups)
+        .order_by('page__source', 'page_id', 'chunk_index')
+    )
+    return list(queryset[:limit])
+
+
 def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[ContentChunk]:
     candidate_limit = max(settings.RAG_RETRIEVE_LIMIT * CANDIDATE_LIMIT_MULTIPLIER, settings.RAG_RETRIEVE_LIMIT)
     candidate_per_page_limit = max(
@@ -782,7 +1420,10 @@ def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[Co
         limit=candidate_limit,
         per_page_limit=candidate_per_page_limit,
     )
-    combined = _sort_candidate_chunks(question, vector_chunks + keyword_chunks)
+    direct_chunks = _retrieve_direct_staff_chunks(
+        question, limit=candidate_limit * 2
+    ) + _retrieve_direct_program_chunks(question, limit=candidate_limit)
+    combined = _sort_candidate_chunks(question, direct_chunks + vector_chunks + keyword_chunks)
     combined = _filter_candidates_for_query(question, combined)
     scoped_chunks, had_scope = _apply_scope_filter(question, combined)
     if had_scope and not scoped_chunks:
@@ -830,8 +1471,9 @@ def _log_chat_timing(
     )
 
 
-def _prepare_chat_context(question: str) -> dict:
-    key = cache_key(question)
+def _prepare_chat_context(question: str, conversation: Conversation) -> dict:
+    resolved_question = _resolve_question_with_conversation(question, conversation)
+    key = cache_key(resolved_question)
     timings: dict[str, float] = {}
 
     cache_start = perf_counter()
@@ -847,24 +1489,21 @@ def _prepare_chat_context(question: str) -> dict:
             'sources': sources,
             'prompt': '',
             'prompt_chars': 0,
+            'resolved_question': resolved_question,
         }
 
     embed_start = perf_counter()
-    query_embedding = embed_query(question)
+    query_embedding = embed_query(resolved_question)
     timings['embed_ms'] = _elapsed_ms(embed_start)
 
     retrieve_start = perf_counter()
-    chunks = _retrieve_candidates(question, query_embedding)
+    chunks = _retrieve_candidates(resolved_question, query_embedding)
     timings['retrieve_ms'] = _elapsed_ms(retrieve_start)
-    scoped_chunks, had_scope = _apply_scope_filter(question, chunks)
-    if had_scope:
-        chunks = scoped_chunks
-
     prompt = ''
     prompt_chars = 0
     prompt_start = perf_counter()
     if chunks:
-        prompt, chunks = build_prompt(question, chunks)
+        prompt, chunks = build_prompt(resolved_question, chunks)
         prompt_chars = len(prompt)
     timings['prompt_ms'] = _elapsed_ms(prompt_start)
 
@@ -876,6 +1515,7 @@ def _prepare_chat_context(question: str) -> dict:
         'sources': build_sources(chunks),
         'prompt': prompt,
         'prompt_chars': prompt_chars,
+        'resolved_question': resolved_question,
     }
 
 
@@ -890,9 +1530,10 @@ def _sse_done() -> str:
 @transaction.atomic
 def chat(question: str, conversation_id: int | None = None) -> dict:
     overall_start = perf_counter()
-    question_hash = _question_hash(question)
     conversation = get_conversation(conversation_id, question)
-    context = _prepare_chat_context(question)
+    context = _prepare_chat_context(question, conversation)
+    resolved_question = context['resolved_question']
+    question_hash = _question_hash(resolved_question)
     timings = context['timings']
     cached_payload = context['cached_payload']
     sources = context['sources']
@@ -916,22 +1557,35 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
             'conversation_id': conversation.id,
             'sources': sources,
             'cached': True,
+            'busy': False,
         }
 
     chunks = context['chunks']
     prompt = context['prompt']
     prompt_chars = context['prompt_chars']
+    llm_busy = False
     if not chunks:
         answer = NO_CONTEXT_ANSWER
         timings['llm_ms'] = 0.0
     else:
-        structured_answer = _build_structured_score_answer(question, chunks)
+        structured_answer = _build_structured_staff_answer(resolved_question, chunks)
+        if not structured_answer:
+            structured_answer = _build_program_presence_answer(resolved_question, chunks)
+        if not structured_answer:
+            structured_answer = _build_structured_score_answer(resolved_question, chunks)
+        if not structured_answer:
+            structured_answer = _build_structured_fee_answer(resolved_question, chunks)
         if structured_answer:
             answer = structured_answer
             timings['llm_ms'] = 0.0
         else:
             llm_start = perf_counter()
-            answer = generate_answer(prompt) or NO_CONTEXT_ANSWER
+            try:
+                answer = _generate_answer_with_slot(prompt) or NO_CONTEXT_ANSWER
+            except LLMBusyError:
+                answer = LLM_BUSY_ANSWER
+                sources = []
+                llm_busy = True
             timings['llm_ms'] = _elapsed_ms(llm_start)
 
     persist_start = perf_counter()
@@ -941,12 +1595,14 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
         'conversation_id': conversation.id,
         'sources': sources,
         'cached': False,
+        'busy': llm_busy,
     }
-    cache.set(
-        context['key'],
-        {'answer': answer, 'sources': sources},
-        timeout=settings.CACHE_TTL,
-    )
+    if not llm_busy:
+        cache.set(
+            context['key'],
+            {'answer': answer, 'sources': sources},
+            timeout=settings.CACHE_TTL,
+        )
     timings['persist_ms'] = _elapsed_ms(persist_start)
     timings['total_ms'] = _elapsed_ms(overall_start)
     _log_chat_timing(
@@ -963,7 +1619,6 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
 
 def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[str]:
     overall_start = perf_counter()
-    question_hash = _question_hash(question)
     conversation = get_conversation(conversation_id, question)
 
     def _event_stream() -> Iterator[str]:
@@ -975,7 +1630,9 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
             },
         )
 
-        context = _prepare_chat_context(question)
+        context = _prepare_chat_context(question, conversation)
+        resolved_question = context['resolved_question']
+        question_hash = _question_hash(resolved_question)
         timings = context['timings']
         cached_payload = context['cached_payload']
         sources = context['sources']
@@ -1009,11 +1666,18 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
 
         chunks = context['chunks']
         answer = NO_CONTEXT_ANSWER
+        llm_busy = False
         if not chunks:
             timings['llm_ms'] = 0.0
             yield _sse_event('token', {'text': answer})
         else:
-            structured_answer = _build_structured_score_answer(question, chunks)
+            structured_answer = _build_structured_staff_answer(resolved_question, chunks)
+            if not structured_answer:
+                structured_answer = _build_program_presence_answer(resolved_question, chunks)
+            if not structured_answer:
+                structured_answer = _build_structured_score_answer(resolved_question, chunks)
+            if not structured_answer:
+                structured_answer = _build_structured_fee_answer(resolved_question, chunks)
             if structured_answer:
                 answer = structured_answer
                 timings['llm_ms'] = 0.0
@@ -1021,24 +1685,32 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
             else:
                 llm_start = perf_counter()
                 answer_parts: list[str] = []
-                for token in generate_answer_stream(context['prompt']):
-                    answer_parts.append(token)
-                    yield _sse_event('token', {'text': token})
+                try:
+                    for token in _generate_answer_stream_with_slot(context['prompt']):
+                        answer_parts.append(token)
+                        yield _sse_event('token', {'text': token})
+                except LLMBusyError:
+                    answer = LLM_BUSY_ANSWER
+                    sources = []
+                    llm_busy = True
+                    yield _sse_event('token', {'text': answer})
                 timings['llm_ms'] = _elapsed_ms(llm_start)
 
-                streamed_answer = ''.join(answer_parts).strip()
-                if streamed_answer:
-                    answer = streamed_answer
-                else:
-                    yield _sse_event('token', {'text': answer})
+                if not llm_busy:
+                    streamed_answer = ''.join(answer_parts).strip()
+                    if streamed_answer:
+                        answer = streamed_answer
+                    else:
+                        yield _sse_event('token', {'text': answer})
 
         persist_start = perf_counter()
         _persist_exchange(conversation, question, answer)
-        cache.set(
-            context['key'],
-            {'answer': answer, 'sources': sources},
-            timeout=settings.CACHE_TTL,
-        )
+        if not llm_busy:
+            cache.set(
+                context['key'],
+                {'answer': answer, 'sources': sources},
+                timeout=settings.CACHE_TTL,
+            )
         timings['persist_ms'] = _elapsed_ms(persist_start)
         timings['total_ms'] = _elapsed_ms(overall_start)
         _log_chat_timing(
