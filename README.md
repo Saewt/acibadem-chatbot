@@ -1,12 +1,13 @@
 # Acibadem Chatbot
 
-Docker Compose ile ayağa kalkan Django tabanlı bir üniversite chatbot uygulaması. Uygulama PostgreSQL + pgvector, Redis, Docker Model Runner ve `sentence-transformers` kullanır. Varsayılan akışta Django servisleri Docker içinde çalışır, embedding API ise host terminalinden açılır.
+Docker Compose ile ayağa kalkan Django tabanlı bir üniversite chatbot uygulaması. Uygulama PostgreSQL + pgvector, Redis, host Ollama ve `sentence-transformers` kullanır. Varsayılan akışta Django servisleri Docker içinde çalışır; LLM ve embedding API host terminalinden açılır.
 
 ## Gereksinimler
 
 - Git
 - Docker Desktop
-- Docker Desktop içinde `Docker Model Runner` özelliği açık olmalı
+- Ollama
+- Python 3.12
 
 ## Quickstart
 
@@ -29,16 +30,22 @@ Varsayılan `.env` değerleri yerel deneme için yeterlidir. Farklı bir port ve
 
 Repo, ilk deneme için temizlenmiş bir bilgi tabanı snapshot'ı içerir. Varsayılan dataset yolu `./data/acibadem-dataset` olduğu için Windows'ta ekstra path ayarı yapmadan bootstrap çalışır. Farklı bir dataset kullanmak istersen `.env` içinde `ACIBADEM_DATASET_HOST_ROOT` değerini örneğin `C:/Users/<kullanici>/Desktop/acibadem-dataset` olarak değiştir.
 
-### 3. Model Runner modelini indir
+### 3. Ollama modelini indir ve başlat
 
-Docker Desktop ayarlarında `Settings > Features in development > Docker Model Runner` etkin olmalı.
+Ollama hostta çalışmalıdır; Docker içindeki web servisi host Ollama'ya `http://host.docker.internal:11434/v1` üzerinden bağlanır.
 
 ```powershell
-docker model pull docker.io/qwen3:4B-UD-Q4_K_XL
-docker model list
+ollama pull qwen3:4b
+ollama serve
 ```
 
-Listede `docker.io/qwen3:4B-UD-Q4_K_XL` görünmelidir. Bu 4B model kullanılacağı için varsayılan `.env` tek eşzamanlı LLM isteği, kısa cevap limiti ve küçük RAG context ile gelir.
+`ollama serve` açık kalmalıdır. Başka bir terminalde modelin göründüğünü kontrol et:
+
+```powershell
+curl http://localhost:11434/api/tags
+```
+
+Listede `qwen3:4b` görünmelidir. Bu 4B model kullanılacağı için varsayılan `.env` tek eşzamanlı LLM isteği, kısa cevap limiti ve küçük RAG context ile gelir.
 
 ### 4. Host embedding API'yi başlat
 
@@ -193,18 +200,19 @@ docker compose down -v
 
 ## Sorun Giderme
 
-### Qwen yavaş veya sistem zorlanıyor
+### Qwen/Ollama yavaş veya sistem zorlanıyor
 
-Varsayılan akış Qwen'i startup'ta ısıtmaz ve aynı anda yalnızca bir LLM isteğine izin verir. Modeli manuel kontrol etmek istersen:
+Varsayılan akış Qwen'i startup'ta ısıtmaz ve aynı anda yalnızca bir LLM isteğine izin verir. Ollama modelini manuel kontrol etmek istersen:
 
 ```powershell
-docker model list
+ollama list
 ```
 
-Gerekirse modeli tekrar indir:
+Gerekirse modeli tekrar indir ve Ollama servisinin ayakta olduğunu kontrol et:
 
 ```powershell
-docker model pull docker.io/qwen3:4B-UD-Q4_K_XL
+ollama pull qwen3:4b
+curl http://localhost:11434/api/tags
 ```
 
 Manuel warmup gerektiğinde açıkça çalıştır:

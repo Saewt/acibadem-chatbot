@@ -184,8 +184,8 @@ def _acquire_llm_slot() -> threading.BoundedSemaphore:
 
 def get_llm_client() -> OpenAI:
     return OpenAI(
-        base_url=settings.MODEL_RUNNER_BASE_URL,
-        api_key=getattr(settings, 'MODEL_RUNNER_API_KEY', 'not-needed'),
+        base_url=settings.LLM_BASE_URL,
+        api_key=getattr(settings, 'LLM_API_KEY', 'not-needed'),
         timeout=settings.LLM_TIMEOUT,
     )
 

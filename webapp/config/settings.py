@@ -99,7 +99,8 @@ MODEL_RUNNER_HOST = os.environ.get(
     'MODEL_RUNNER_HOST', 'http://model-runner.docker.internal'
 ).rstrip('/')
 MODEL_RUNNER_BASE_URL = f'{MODEL_RUNNER_HOST}/engines/v1'
-LLM_MODEL = os.environ.get('LLM_MODEL', 'docker.io/qwen3:4B-UD-Q4_K_XL')
+LLM_BASE_URL = os.environ.get('LLM_BASE_URL', MODEL_RUNNER_BASE_URL).rstrip('/')
+LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen3:4b')
 LLM_WARMUP_ENABLED = _env_bool('LLM_WARMUP_ENABLED', False)
 LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', '160'))
 LLM_TIMEOUT = float(os.environ.get('LLM_TIMEOUT', '60'))

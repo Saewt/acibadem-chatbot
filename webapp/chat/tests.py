@@ -25,6 +25,7 @@ from .services import (
     cache_key,
     chat,
     chat_stream,
+    get_llm_client,
     retrieve_keyword_context,
 )
 
@@ -44,6 +45,21 @@ class ChatServiceTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+
+    @override_settings(
+        LLM_BASE_URL='http://host.docker.internal:11434/v1',
+        LLM_API_KEY='ollama-test-key',
+        LLM_TIMEOUT=12,
+    )
+    @patch('chat.services.OpenAI')
+    def test_get_llm_client_uses_configured_base_url(self, openai_mock):
+        get_llm_client()
+
+        openai_mock.assert_called_once_with(
+            base_url='http://host.docker.internal:11434/v1',
+            api_key='ollama-test-key',
+            timeout=12,
+        )
 
     @patch('chat.api.chat')
     def test_chat_endpoint_returns_service_payload(self, chat_mock):
