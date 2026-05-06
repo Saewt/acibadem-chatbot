@@ -32,7 +32,7 @@ Repo, ilk deneme için temizlenmiş bir bilgi tabanı snapshot'ı içerir. Varsa
 
 ### 3. Ollama modelini indir ve başlat
 
-Ollama hostta çalışmalıdır; Docker içindeki web servisi host Ollama'ya `http://host.docker.internal:11434/v1` üzerinden bağlanır.
+Ollama hostta çalışmalıdır; Docker içindeki web servisi host Ollama'ya `http://host.docker.internal:11434` üzerinden bağlanır.
 
 ```powershell
 ollama pull qwen3:4b
@@ -45,7 +45,7 @@ ollama serve
 curl http://localhost:11434/api/tags
 ```
 
-Listede `qwen3:4b` görünmelidir. Bu 4B model kullanılacağı için varsayılan `.env` tek eşzamanlı LLM isteği, kısa cevap limiti ve küçük RAG context ile gelir.
+Listede `qwen3:4b` görünmelidir. Bu 4B model kullanılacağı için varsayılan `.env` tek eşzamanlı LLM isteği, kontrollü cevap limiti ve küçük RAG context ile gelir.
 
 ### 4. Host embedding API'yi başlat
 
@@ -221,7 +221,7 @@ Manuel warmup gerektiğinde açıkça çalıştır:
 docker compose exec web python manage.py warm_models --llm
 ```
 
-Yanıt sırasında sistem hâlâ zorlanıyorsa `.env` içinde `LLM_MAX_TOKENS`, `RAG_RETRIEVE_LIMIT` ve `RAG_MAX_CONTEXT_CHARS` değerlerini daha da düşür. Varsayılanlar MacBook Air için düşük tutulur: tek LLM isteği, kısa cevap limiti ve küçük RAG context.
+Yanıt sırasında sistem hâlâ zorlanıyorsa `.env` içinde `LLM_MAX_TOKENS`, `RAG_RETRIEVE_LIMIT` ve `RAG_MAX_CONTEXT_CHARS` değerlerini daha da düşür. Varsayılanlar MacBook Air için kontrollü tutulur: tek LLM isteği, sınırlı cevap limiti ve küçük RAG context.
 
 Host embedding API gerçekten ayakta mı kontrol et:
 

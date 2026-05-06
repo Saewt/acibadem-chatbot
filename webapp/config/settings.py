@@ -99,10 +99,17 @@ MODEL_RUNNER_HOST = os.environ.get(
     'MODEL_RUNNER_HOST', 'http://model-runner.docker.internal'
 ).rstrip('/')
 MODEL_RUNNER_BASE_URL = f'{MODEL_RUNNER_HOST}/engines/v1'
-LLM_BASE_URL = os.environ.get('LLM_BASE_URL', MODEL_RUNNER_BASE_URL).rstrip('/')
+LLM_BACKEND = os.environ.get('LLM_BACKEND', 'ollama').strip().lower()
+LLM_DEFAULT_BASE_URL = (
+    'http://host.docker.internal:11434'
+    if LLM_BACKEND == 'ollama'
+    else MODEL_RUNNER_BASE_URL
+)
+LLM_BASE_URL = os.environ.get('LLM_BASE_URL', LLM_DEFAULT_BASE_URL).rstrip('/')
 LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen3:4b')
+LLM_THINK = _env_bool('LLM_THINK', True)
 LLM_WARMUP_ENABLED = _env_bool('LLM_WARMUP_ENABLED', False)
-LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', '160'))
+LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', '512'))
 LLM_TIMEOUT = float(os.environ.get('LLM_TIMEOUT', '60'))
 LLM_MAX_CONCURRENT_REQUESTS = max(
     int(os.environ.get('LLM_MAX_CONCURRENT_REQUESTS', '1')),

@@ -7,6 +7,7 @@ import unicodedata
 from collections.abc import Iterator
 from time import perf_counter
 
+import requests
 from django.conf import settings
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
 from django.core.cache import cache
@@ -190,22 +191,104 @@ def get_llm_client() -> OpenAI:
     )
 
 
+def _ollama_api_base_url() -> str:
+    base_url = settings.LLM_BASE_URL.rstrip('/')
+    if base_url.endswith('/v1'):
+        base_url = base_url[:-3].rstrip('/')
+    return base_url
+
+
+def _use_ollama_backend() -> bool:
+    return getattr(settings, 'LLM_BACKEND', 'ollama') == 'ollama'
+
+
+def _ollama_chat_payload(
+    messages: list[dict[str, str]],
+    *,
+    stream: bool,
+    temperature: float,
+    max_tokens: int,
+) -> dict:
+    return {
+        'model': settings.LLM_MODEL,
+        'messages': messages,
+        'stream': stream,
+        'think': getattr(settings, 'LLM_THINK', True),
+        'options': {
+            'temperature': temperature,
+            'num_predict': max_tokens,
+        },
+    }
+
+
+def _ollama_chat(messages: list[dict[str, str]], *, temperature: float, max_tokens: int) -> str:
+    response = requests.post(
+        f'{_ollama_api_base_url()}/api/chat',
+        json=_ollama_chat_payload(
+            messages,
+            stream=False,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ),
+        timeout=settings.LLM_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return str(payload.get('message', {}).get('content') or '').strip()
+
+
+def _ollama_chat_stream(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float,
+    max_tokens: int,
+) -> Iterator[str]:
+    with requests.post(
+        f'{_ollama_api_base_url()}/api/chat',
+        json=_ollama_chat_payload(
+            messages,
+            stream=True,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ),
+        stream=True,
+        timeout=settings.LLM_TIMEOUT,
+    ) as response:
+        response.raise_for_status()
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            payload = json.loads(raw_line)
+            if payload.get('error'):
+                raise RuntimeError(str(payload['error']))
+            content = payload.get('message', {}).get('content')
+            if content:
+                yield str(content)
+            if payload.get('done'):
+                break
+
+
 def warm_embedding_model() -> None:
     embed_text('warmup')
 
 
 def warm_llm_model() -> None:
+    messages = [
+        {
+            'role': 'system',
+            'content': 'Return a one-word acknowledgement.',
+        },
+        {'role': 'user', 'content': 'Ping'},
+    ]
+    if _use_ollama_backend():
+        _ = _ollama_chat(messages, temperature=0, max_tokens=1)
+        return
+
     response = get_llm_client().chat.completions.create(
         model=settings.LLM_MODEL,
         temperature=0,
         max_tokens=1,
-        messages=[
-            {
-                'role': 'system',
-                'content': 'Return a one-word acknowledgement.',
-            },
-            {'role': 'user', 'content': 'Ping'},
-        ],
+        messages=messages,
     )
     _ = response.choices[0].message.content
 
@@ -1045,18 +1128,32 @@ def _build_program_presence_answer(question: str, chunks: list[ContentChunk]) ->
     if not program_title:
         return ''
 
+    program_terms = _program_lookup_terms(program_title)
     matching_chunks = [
         chunk
         for chunk in chunks
-        if _normalized_contains(
-            _get_chunk_metadata_value(chunk, 'program_title') or chunk.page.title,
-            program_title,
+        if any(
+            _normalized_contains(
+                ' '.join(
+                    value
+                    for value in (
+                        _get_chunk_metadata_value(chunk, 'program_title'),
+                        _get_chunk_metadata_value(chunk, 'placement_label'),
+                        _get_chunk_metadata_value(chunk, 'unit_name'),
+                        chunk.page.title,
+                    )
+                    if value
+                ),
+                term,
+            )
+            for term in program_terms
         )
     ]
     if not matching_chunks:
         return ''
 
     chunk = matching_chunks[0]
+    display_title = _get_chunk_metadata_value(chunk, 'program_title') or program_title
     faculty = _get_chunk_metadata_value(chunk, 'faculty')
     level = _get_chunk_metadata_value(chunk, 'admission_level')
     details = []
@@ -1065,7 +1162,7 @@ def _build_program_presence_answer(question: str, chunks: list[ContentChunk]) ->
     if level:
         details.append('ön lisans' if level == 'onlisans' else level)
     suffix = f" ({', '.join(details)})" if details else ''
-    return f'Evet, Acıbadem Üniversitesi resmi kaynaklarında {program_title} programı var{suffix}.'
+    return f'Evet, Acıbadem Üniversitesi resmi kaynaklarında {display_title} programı var{suffix}.'
 
 
 def retrieve_context(
@@ -1228,17 +1325,25 @@ def build_prompt(question: str, chunks: list[ContentChunk]) -> tuple[str, list[C
 
 
 def generate_answer(prompt: str) -> str:
+    messages = [
+        {
+            'role': 'system',
+            'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
+        },
+        {'role': 'user', 'content': prompt},
+    ]
+    if _use_ollama_backend():
+        return _ollama_chat(
+            messages,
+            temperature=0.1,
+            max_tokens=settings.LLM_MAX_TOKENS,
+        )
+
     response = get_llm_client().chat.completions.create(
         model=settings.LLM_MODEL,
         temperature=0.1,
         max_tokens=settings.LLM_MAX_TOKENS,
-        messages=[
-            {
-                'role': 'system',
-                'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
-            },
-            {'role': 'user', 'content': prompt},
-        ],
+        messages=messages,
     )
     return (response.choices[0].message.content or '').strip()
 
@@ -1272,17 +1377,26 @@ def _iter_delta_content_text(delta_content: object) -> Iterator[str]:
 
 
 def generate_answer_stream(prompt: str) -> Iterator[str]:
+    messages = [
+        {
+            'role': 'system',
+            'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
+        },
+        {'role': 'user', 'content': prompt},
+    ]
+    if _use_ollama_backend():
+        yield from _ollama_chat_stream(
+            messages,
+            temperature=0.1,
+            max_tokens=settings.LLM_MAX_TOKENS,
+        )
+        return
+
     stream = get_llm_client().chat.completions.create(
         model=settings.LLM_MODEL,
         temperature=0.1,
         max_tokens=settings.LLM_MAX_TOKENS,
-        messages=[
-            {
-                'role': 'system',
-                'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
-            },
-            {'role': 'user', 'content': prompt},
-        ],
+        messages=messages,
         stream=True,
     )
     for chunk in stream:

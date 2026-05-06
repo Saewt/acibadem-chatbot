@@ -25,6 +25,7 @@ from .services import (
     cache_key,
     chat,
     chat_stream,
+    generate_answer,
     get_llm_client,
     retrieve_keyword_context,
 )
@@ -60,6 +61,38 @@ class ChatServiceTests(TestCase):
             api_key='ollama-test-key',
             timeout=12,
         )
+
+    @override_settings(
+        LLM_BACKEND='ollama',
+        LLM_BASE_URL='http://host.docker.internal:11434/v1',
+        LLM_MODEL='qwen3:4b',
+        LLM_MAX_TOKENS=512,
+        LLM_TIMEOUT=12,
+        LLM_THINK=True,
+    )
+    @patch('chat.services.requests.post')
+    def test_generate_answer_uses_ollama_native_chat_api(self, post_mock):
+        response_mock = post_mock.return_value
+        response_mock.json.return_value = {
+            'message': {
+                'content': 'Bilgisayar Mühendisliği programı vardır. [1]',
+                'thinking': 'hidden reasoning',
+            }
+        }
+
+        answer = generate_answer('Bilgisayar mühendisliği var mı?')
+
+        self.assertEqual(answer, 'Bilgisayar Mühendisliği programı vardır. [1]')
+        post_mock.assert_called_once()
+        self.assertEqual(
+            post_mock.call_args.args[0],
+            'http://host.docker.internal:11434/api/chat',
+        )
+        body = post_mock.call_args.kwargs['json']
+        self.assertEqual(body['model'], 'qwen3:4b')
+        self.assertEqual(body['think'], True)
+        self.assertEqual(body['options']['num_predict'], 512)
+        response_mock.raise_for_status.assert_called_once()
 
     @patch('chat.api.chat')
     def test_chat_endpoint_returns_service_payload(self, chat_mock):
@@ -1089,6 +1122,45 @@ class ChatServiceTests(TestCase):
             payload['answer'],
             'Bilgisayar Mühendisliği akademik kadro kaynağında 1 hoca kaydı var.',
         )
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_program_presence_from_placement_label_without_llm(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-muhendisligi',
+            source='structured',
+            title='Bilgisayar Mühendisliği (İngilizce) (Burslu) - Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-program-presence',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği (İngilizce) kontenjan ve puan bilgileri',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+                'placement_label': 'Bilgisayar Mühendisliği (İngilizce) (Burslu)',
+                'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+                'admission_level': 'lisans',
+            },
+        )
+        retrieve_context_mock.return_value = [chunk]
+
+        payload = chat('bilgisayar mühendisliği var mı acaba?')
+
+        self.assertIn('Bilgisayar Mühendisliği (İngilizce) programı var', payload['answer'])
+        self.assertIn('Mühendislik ve Doğa Bilimleri Fakültesi', payload['answer'])
         generate_answer_mock.assert_not_called()
 
     @patch('chat.services.generate_answer')
