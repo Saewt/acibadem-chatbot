@@ -544,12 +544,37 @@ _SCOPE_STOP_WORDS = frozenset({
 })
 
 
+GENERAL_INFO_QUERY_PATTERN = re.compile(
+    r'\b(bilgi\w*|hakk[ıi]nda|nedir|tan[ıi]t[ıi]m\w*)\b'
+)
+GENERAL_INFO_SCOPE_PATTERN = re.compile(
+    r'\b(fakülte\w*|fakulte\w*|bölüm\w*|bolum\w*|program\w*)\b'
+)
+SCOPE_METADATA_FIELDS = (
+    'program_alias_text',
+    'placement_label',
+    'program_title',
+    'faculty',
+    'unit_name',
+    'section_title',
+    'page_title',
+)
+
+
+def _chunk_scope_aliases(chunk: ContentChunk) -> set[str]:
+    aliases: set[str] = set()
+    for field in SCOPE_METADATA_FIELDS:
+        aliases.update(_build_scope_aliases(_get_chunk_metadata_value(chunk, field)))
+    aliases.update(_build_scope_aliases(chunk.page.title))
+    return aliases
+
+
 def _build_scope_constraint(question: str, chunks: list[ContentChunk]) -> dict | None:
     normalized_question = _normalize_lookup_text(question)
     if not normalized_question:
         return None
 
-    for field in ('program_alias_text', 'placement_label', 'program_title', 'faculty'):
+    for field in SCOPE_METADATA_FIELDS:
         matched_aliases: dict[int, set[str]] = {}
         for chunk in chunks:
             for alias in _build_scope_aliases(_get_chunk_metadata_value(chunk, field)):
@@ -594,8 +619,7 @@ def _apply_scope_filter(question: str, chunks: list[ContentChunk]) -> tuple[list
     filtered = [
         chunk
         for chunk in chunks
-        if _build_scope_aliases(_get_chunk_metadata_value(chunk, scope['field']))
-        & scope['aliases']
+        if _chunk_scope_aliases(chunk) & scope['aliases']
     ]
     return filtered, True
 
@@ -635,6 +659,14 @@ def _is_staff_list_query(question: str) -> bool:
 
 def _is_program_exists_query(question: str) -> bool:
     return bool(PROGRAM_EXISTS_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
+def _is_general_info_query(question: str) -> bool:
+    normalized_question = _normalize_lookup_text(question)
+    return bool(
+        GENERAL_INFO_QUERY_PATTERN.search(normalized_question)
+        and GENERAL_INFO_SCOPE_PATTERN.search(normalized_question)
+    )
 
 
 def _is_dentistry_query(question: str) -> bool:
@@ -733,6 +765,15 @@ def _chunk_priority(question: str, chunk: ContentChunk) -> int:
         if kind == 'bologna_program_page':
             return 4
         return 5
+
+    if _is_general_info_query(question):
+        if kind == 'main_site_page' and _get_chunk_metadata_value(chunk, 'source_group') == 'department':
+            return 0
+        if kind == 'bologna_program_page':
+            return 1
+        if kind == 'main_site_staff_page' or record_type == 'academic_staff_member':
+            return 4
+        return 2
 
     if _is_score_query(question):
         if kind == 'structured_admissions_score' or record_type == 'quota_row':
@@ -1003,6 +1044,61 @@ def _build_structured_fee_answer(question: str, chunks: list[ContentChunk]) -> s
             metrics.append('ücret bilgisi kaynakta yer almıyor')
         lines.append(f'- {_clean_display_text(label)}: {", ".join(metrics)}.')
     return '\n'.join(lines)
+
+
+def _general_info_excerpt(chunk: ContentChunk) -> str:
+    text = _clean_display_text(chunk.text)
+    title = _clean_display_text(
+        _get_chunk_metadata_value(chunk, 'section_title')
+        or _get_chunk_metadata_value(chunk, 'page_title')
+        or chunk.page.title
+    )
+    markers = [
+        f'{title} Hakkında',
+        'Hakkında',
+        f'{title} Hakkinda',
+        'Hakkinda',
+    ]
+    for marker in markers:
+        index = text.casefold().find(marker.casefold())
+        if index >= 0:
+            text = text[index + len(marker):].strip(' :-')
+            break
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r'(?<=[.!?])\s+', text)
+        if len(sentence.strip()) > 20
+    ]
+    excerpt = ' '.join(sentences[:2]).strip()
+    if excerpt:
+        return excerpt
+    return text[:500].rsplit(' ', 1)[0].strip()
+
+
+def _build_general_info_answer(question: str, chunks: list[ContentChunk]) -> str:
+    if not _is_general_info_query(question):
+        return ''
+
+    info_chunks = [
+        chunk
+        for chunk in chunks
+        if _get_chunk_metadata_value(chunk, 'kind') == 'main_site_page'
+        and _get_chunk_metadata_value(chunk, 'source_group') == 'department'
+    ]
+    if not info_chunks:
+        return ''
+
+    chunk = info_chunks[0]
+    title = _clean_display_text(
+        _get_chunk_metadata_value(chunk, 'section_title')
+        or _get_chunk_metadata_value(chunk, 'page_title')
+        or chunk.page.title
+    )
+    excerpt = _general_info_excerpt(chunk)
+    if not excerpt:
+        return ''
+    return f'{title} hakkında resmi kaynakta şu bilgi yer alıyor: {excerpt} [1]'
 
 
 def _staff_member_chunks_for_context(chunks: list[ContentChunk]) -> list[ContentChunk]:
@@ -1689,6 +1785,8 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
             structured_answer = _build_structured_score_answer(resolved_question, chunks)
         if not structured_answer:
             structured_answer = _build_structured_fee_answer(resolved_question, chunks)
+        if not structured_answer:
+            structured_answer = _build_general_info_answer(resolved_question, chunks)
         if structured_answer:
             answer = structured_answer
             timings['llm_ms'] = 0.0
@@ -1792,6 +1890,8 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
                 structured_answer = _build_structured_score_answer(resolved_question, chunks)
             if not structured_answer:
                 structured_answer = _build_structured_fee_answer(resolved_question, chunks)
+            if not structured_answer:
+                structured_answer = _build_general_info_answer(resolved_question, chunks)
             if structured_answer:
                 answer = structured_answer
                 timings['llm_ms'] = 0.0

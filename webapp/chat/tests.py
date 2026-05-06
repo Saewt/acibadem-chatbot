@@ -1167,6 +1167,66 @@ class ChatServiceTests(TestCase):
     @patch('chat.services.retrieve_keyword_context', return_value=[])
     @patch('chat.services.retrieve_context')
     @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_prioritizes_department_page_for_general_faculty_info(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/eczacilik-akademik-kadro',
+            source='main_site',
+            title='Eczacılık Fakültesi - Akademik Kadro',
+            content_text='staff',
+            raw_html='{}',
+            content_hash='hash-ecz-staff-info',
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Eczacılık Fakültesi akademik kadro | isim: Ayşe Yılmaz | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Eczacılık Fakültesi',
+                'section_title': 'Eczacılık Fakültesi - Akademik Kadro',
+                'source_group': 'department',
+            },
+        )
+        department_page = WebPage.objects.create(
+            url='https://example.com/eczacilik-fakultesi',
+            source='main_site',
+            title='Eczacılık Fakültesi',
+            content_text='Eczacılık Fakültesi hakkında genel bilgi.',
+            raw_html='{}',
+            content_hash='hash-ecz-department-info',
+        )
+        department_chunk = ContentChunk.objects.create(
+            page=department_page,
+            chunk_index=0,
+            text='Eczacılık Fakültesi Hakkında misyon, eğitim ve laboratuvar bilgileri.',
+            metadata={
+                'kind': 'main_site_page',
+                'section_title': 'Eczacılık Fakültesi',
+                'page_title': 'Eczacılık Fakültesi',
+                'source_group': 'department',
+            },
+        )
+        retrieve_context_mock.return_value = [staff_chunk, department_chunk]
+
+        payload = chat('Eczacılık fakültesi bilgi')
+
+        self.assertIn('Eczacılık Fakültesi hakkında resmi kaynakta', payload['answer'])
+        self.assertIn('misyon, eğitim ve laboratuvar bilgileri', payload['answer'])
+        self.assertIn('[1]', payload['answer'])
+        self.assertEqual(payload['sources'][0]['title'], 'Eczacılık Fakültesi')
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
     def test_chat_distinguishes_dentistry_from_oral_health_program(
         self,
         _embed_query_mock,
