@@ -481,6 +481,60 @@ class ScraperServiceTests(TestCase):
         self.assertIn('Ayşe Yılmaz', extracted.text)
         self.assertIn('Mehmet Kaya', extracted.text)
 
+    def test_extract_main_site_page_structures_role_assignments(self):
+        html = """
+        <html>
+          <body>
+            <nav aria-label="breadcrumb">
+              <ol class="breadcrumb">
+                <li><a>Tıp Fakültesi</a></li>
+                <li>Tıp Fakültesi Yönetimi</li>
+              </ol>
+            </nav>
+            <main>
+              <h1>Tıp Fakültesi Yönetimi</h1>
+              <div id="block-acu-content">
+                <div class="accordion-item">
+                  <h2 class="accordion-header">
+                    <button class="accordion-button">Dekan</button>
+                  </h2>
+                  <div class="board-of-directors-wrapper">
+                    <div class="board-of-directors-detail-wrapper">
+                      <p class="title">Prof. Dr. Nadi Bakırcı</p>
+                    </div>
+                  </div>
+                </div>
+                <div class="accordion-item">
+                  <h2 class="accordion-header">
+                    <button class="accordion-button">Fakülte Yönetim Kurulu</button>
+                  </h2>
+                  <div class="board-of-directors-wrapper">
+                    <div class="board-of-directors-detail-wrapper">
+                      <p class="title">Prof. Dr. Elif Aydınlar</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </main>
+          </body>
+        </html>
+        """
+
+        extracted = extract_main_site_page(
+            'https://www.acibadem.edu.tr/akademik/lisans/tip-fakultesi/tip-fakultesi-yonetimi',
+            html,
+        )
+
+        self.assertIsNotNone(extracted)
+        self.assertEqual(extracted.metadata['kind'], 'main_site_role_page')
+        self.assertEqual(extracted.metadata['record_type'], 'staff_role_assignment')
+        self.assertEqual(extracted.metadata['role_count'], 2)
+        self.assertEqual(extracted.metadata['faculty'], 'Tıp Fakültesi')
+        self.assertIn(
+            'Tıp Fakültesi yönetim | rol: Dekan | isim: Prof. Dr. Nadi Bakırcı',
+            extracted.text,
+        )
+
     def test_extract_bologna_page_structures_staff_entries(self):
         html = """
         <html>
@@ -521,6 +575,14 @@ class ScraperServiceTests(TestCase):
     def test_default_main_site_seeds_include_staff_pages(self):
         self.assertIn(
             'https://www.acibadem.edu.tr/akademik/lisans/muhendislik-ve-doga-bilimleri-fakultesi/akademik-kadro',
+            DEFAULT_MAIN_SITE_SEEDS,
+        )
+        self.assertIn(
+            'https://www.acibadem.edu.tr/akademik/lisans/tip-fakultesi/tip-fakultesi-yonetimi',
+            DEFAULT_MAIN_SITE_SEEDS,
+        )
+        self.assertIn(
+            'https://www.acibadem.edu.tr/akademik/lisans/tip-fakultesi/dekanin-mesaji',
             DEFAULT_MAIN_SITE_SEEDS,
         )
         self.assertIn('https://www.acibadem.edu.tr/akademik/onlisans', DEFAULT_MAIN_SITE_SEEDS)

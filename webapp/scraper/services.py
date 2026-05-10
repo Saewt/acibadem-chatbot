@@ -40,6 +40,8 @@ DEFAULT_MAIN_SITE_SEEDS = (
     'https://www.acibadem.edu.tr/aday/ogrenci',
     'https://www.acibadem.edu.tr/surdurulebilir-kampus',
     'https://www.acibadem.edu.tr/akademik/lisans/tip-fakultesi/akademik-kadro',
+    'https://www.acibadem.edu.tr/akademik/lisans/tip-fakultesi/tip-fakultesi-yonetimi',
+    'https://www.acibadem.edu.tr/akademik/lisans/tip-fakultesi/dekanin-mesaji',
     'https://www.acibadem.edu.tr/akademik/lisans/muhendislik-ve-doga-bilimleri-fakultesi/akademik-kadro',
     'https://www.acibadem.edu.tr/akademik/lisans/saglik-bilimleri-fakultesi/akademik-kadro',
     'https://www.acibadem.edu.tr/akademik/lisans/insan-ve-toplum-bilimleri-fakultesi/akademik-kadro',
@@ -134,6 +136,16 @@ STAFF_ROLE_KEYWORDS = (
     'coordinator',
     'koordinat',
 )
+MANAGEMENT_ROLE_KEYWORDS = (
+    'başkan',
+    'baskan',
+    'dekan',
+    'müdür',
+    'mudur',
+    'koordinat',
+    'yönetim',
+    'yonetim',
+)
 STAFF_CARD_SELECTORS = (
     '.views-row',
     '.person-card',
@@ -173,6 +185,7 @@ MAIN_SITE_UNIT_KEYWORDS = (
     'enstitu',
 )
 MAIN_SITE_GENERIC_CRUMBS = {
+    'anasayfa',
     'üniversite',
     'universite',
     'akademik',
@@ -753,7 +766,7 @@ def _infer_main_site_scope(url: str, soup: BeautifulSoup, title: str) -> dict:
         if not normalized or lowered in MAIN_SITE_GENERIC_CRUMBS:
             continue
         meaningful_breadcrumbs.append(normalized)
-        if any(keyword in lowered for keyword in MAIN_SITE_UNIT_KEYWORDS):
+        if not faculty and any(keyword in lowered for keyword in MAIN_SITE_UNIT_KEYWORDS):
             faculty = normalized
 
     for crumb in reversed(meaningful_breadcrumbs):
@@ -984,6 +997,119 @@ def _build_staff_page_text(metadata: dict, entries: list[dict], *, count_label: 
     return '\n'.join(lines)
 
 
+def _looks_like_management_role(value: str) -> bool:
+    role = normalize_whitespace(value)
+    lowered = _normalize_lookup_text(role)
+    return bool(role and len(role) <= 120 and any(keyword in lowered for keyword in MANAGEMENT_ROLE_KEYWORDS))
+
+
+def _extract_management_role_label(section: BeautifulSoup) -> str:
+    for selector in (
+        '.accordion-button',
+        '.accordion-header button',
+        '.accordion-header',
+        'button',
+        'h2',
+        'h3',
+    ):
+        candidate = section.select_one(selector)
+        if candidate is None:
+            continue
+        role = normalize_whitespace(candidate.get_text(' ', strip=True))
+        if _looks_like_management_role(role):
+            return role
+    return ''
+
+
+def _extract_management_person_name(card: BeautifulSoup) -> str:
+    for selector in (
+        '.board-of-directors-detail-wrapper .title',
+        '.board-of-directors-wrapper .title',
+        'p.title',
+        '.title',
+        'h3',
+        'h4',
+    ):
+        candidate = card.select_one(selector)
+        if candidate is None:
+            continue
+        name = normalize_whitespace(candidate.get_text(' ', strip=True))
+        if _is_probable_person_name(name):
+            return name
+
+    for image in card.select('img[alt]'):
+        name = normalize_whitespace(image.get('alt', ''))
+        if _is_probable_person_name(name):
+            return name
+    return ''
+
+
+def _add_role_assignment(
+    assignments: list[dict],
+    seen_keys: set[tuple[str, str]],
+    role: str,
+    name: str,
+) -> None:
+    normalized_role = normalize_whitespace(role)
+    normalized_name = normalize_whitespace(name)
+    if not _looks_like_management_role(normalized_role) or not _is_probable_person_name(normalized_name):
+        return
+    key = (_normalize_lookup_text(normalized_role), _normalize_lookup_text(normalized_name))
+    if key in seen_keys:
+        return
+    seen_keys.add(key)
+    assignments.append({'role': normalized_role, 'name': normalized_name})
+
+
+def _management_cards(section: BeautifulSoup) -> list[BeautifulSoup]:
+    cards: list[BeautifulSoup] = []
+    for selector in (
+        '.board-of-directors-wrapper',
+        '.management-card',
+        '.person-card',
+        '.card',
+        '.views-row',
+    ):
+        cards.extend(section.select(selector))
+    return cards or [section]
+
+
+def _extract_role_assignments_from_management_page(node: BeautifulSoup, fallback_text: str) -> list[dict]:
+    assignments: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()
+    sections = node.select('.accordion-item') or node.select('section')
+    for section in sections:
+        role = _extract_management_role_label(section)
+        if not role:
+            continue
+        for card in _management_cards(section):
+            name = _extract_management_person_name(card)
+            _add_role_assignment(assignments, seen_keys, role, name)
+
+    if assignments:
+        return assignments
+
+    lines = _ordered_unique_texts(fallback_text.splitlines())
+    for index, line in enumerate(lines):
+        if not _looks_like_management_role(line):
+            continue
+        next_line = lines[index + 1] if index + 1 < len(lines) else ''
+        _add_role_assignment(assignments, seen_keys, line, next_line)
+    return assignments
+
+
+def _build_role_assignment_text(metadata: dict, assignments: list[dict]) -> str:
+    scope = metadata.get('faculty') or metadata.get('program_title') or ''
+    scope = normalize_whitespace(re.sub(r'\s+(yönetimi|yonetimi)$', '', scope, flags=re.IGNORECASE))
+    lines = []
+    if scope:
+        lines.append(f'Birim: {scope}')
+    for assignment in assignments:
+        prefix = f'{scope} yönetim' if scope else 'Yönetim'
+        lines.append(f"{prefix} | rol: {assignment['role']} | isim: {assignment['name']}")
+    return '\n'.join(lines)
+
+
 def extract_main_site_page(url: str, html: str) -> ExtractedPage | None:
     soup = BeautifulSoup(html, 'html.parser')
     title = ''
@@ -1006,6 +1132,8 @@ def extract_main_site_page(url: str, html: str) -> ExtractedPage | None:
         return None
 
     metadata = _infer_main_site_scope(url, soup, title)
+    role_content = BeautifulSoup(str(content_node), 'html.parser')
+    role_text = normalize_whitespace(role_content.get_text('\n', strip=True))
     content = BeautifulSoup(str(content_node), 'html.parser')
     _strip_irrelevant_nodes(content)
     _strip_main_site_program_noise(url, content)
@@ -1020,10 +1148,17 @@ def extract_main_site_page(url: str, html: str) -> ExtractedPage | None:
             metadata['staff_count'] = len(entries)
             text = _build_staff_page_text(metadata, entries, count_label='hoca')
     else:
-        metadata['kind'] = 'main_site_page'
-        metadata.update(_candidate_topic_metadata(url))
-        if metadata.get('kind') == 'candidate_topic_page':
-            metadata.setdefault('section_title', title or metadata.get('topic_label', ''))
+        role_assignments = _extract_role_assignments_from_management_page(role_content, role_text)
+        if role_assignments:
+            metadata['kind'] = 'main_site_role_page'
+            metadata['record_type'] = 'staff_role_assignment'
+            metadata['role_count'] = len(role_assignments)
+            text = _build_role_assignment_text(metadata, role_assignments)
+        else:
+            metadata['kind'] = 'main_site_page'
+            metadata.update(_candidate_topic_metadata(url))
+            if metadata.get('kind') == 'candidate_topic_page':
+                metadata.setdefault('section_title', title or metadata.get('topic_label', ''))
 
     if len(text) < MIN_USEFUL_TEXT_LENGTH:
         return None

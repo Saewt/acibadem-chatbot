@@ -31,9 +31,20 @@ LLM_BUSY_ANSWER = (
     'Lütfen birkaç saniye sonra tekrar deneyin.'
 )
 QUESTION_HASH_LENGTH = 12
-CACHE_KEY_VERSION = 'v8'
+CACHE_KEY_VERSION = 'v12'
 CANDIDATE_LIMIT_MULTIPLIER = 3
 SSE_DONE_SENTINEL = '[DONE]'
+PROGRAM_ABBREVIATION_MIN_LENGTH = 3
+PROGRAM_ABBREVIATION_STOP_WORDS = frozenset({
+    've',
+    'ile',
+    'and',
+    'of',
+    'the',
+    'ingilizce',
+    'türkçe',
+    'turkce',
+})
 STAFF_QUERY_PATTERN = re.compile(
     r'\b('
     r'hoca\w*|'
@@ -65,6 +76,9 @@ STAFF_COUNT_QUERY_PATTERN = re.compile(
 DEPARTMENT_HEAD_QUERY_PATTERN = re.compile(
     r'\b(bölüm\s*başkan\w*|bolum\s*baskan\w*)\b'
 )
+DEPUTY_DEAN_QUERY_PATTERN = re.compile(r'\bdekan\s+yardimc\w*\b')
+DEAN_QUERY_PATTERN = re.compile(r'\bdekan\w*\b')
+DIRECTOR_QUERY_PATTERN = re.compile(r'\bmudur\w*\b')
 PROGRAM_EXISTS_QUERY_PATTERN = re.compile(
     r'\b(var\s*m[ıi]|bulunuyor\s*mu|mevcut\s*mu|aç[ıi]k\s*m[ıi])\b'
 )
@@ -93,6 +107,12 @@ FEE_QUERY_PATTERN = re.compile(
     r'harc\w*'
     r')\b'
 )
+EXPLICIT_PROGRAM_ABBREVIATIONS = (
+    (
+        re.compile(r'\b(?:pc|bilg(?:isayar)?)\s+(?:müh\w*|muh\w*)\b'),
+        'Bilgisayar Mühendisliği',
+    ),
+)
 SCHOLARSHIP_QUERY_PATTERN = re.compile(r'\b(burs\w*|scholarship\w*)\b')
 DORMITORY_QUERY_PATTERN = re.compile(r'\b(yurt\w*|depozito\w*|konaklama\w*|dorm\w*)\b')
 INTERNATIONAL_QUERY_PATTERN = re.compile(
@@ -113,10 +133,15 @@ COURSE_QUERY_PATTERN = re.compile(
     r'mufredat\w*|'
     r'yarıyıl\w*|'
     r'yariyil\w*|'
+    r'sınıf\w*|'
+    r'sinif\w*|'
     r'akts\w*|'
     r'ects\w*|'
     r'semester\w*'
     r')\b'
+)
+COURSE_FULL_LIST_QUERY_PATTERN = re.compile(
+    r'\b(tüm\s+ders\w*|tum\s+ders\w*|heps\w*|tam\s+liste\w*|listele\w*)\b'
 )
 TOPIC_KEYWORDS = {
     'scholarships': (
@@ -461,6 +486,64 @@ def _extract_program_hint_from_text(text: str) -> str:
     return ''
 
 
+def _program_initialism(value: str) -> str:
+    cleaned = _program_initialism_base(value)
+    tokens = [
+        token
+        for token in _normalize_lookup_text(cleaned).split()
+        if token and token not in PROGRAM_ABBREVIATION_STOP_WORDS
+    ]
+    initialism = ''.join(token[0] for token in tokens)
+    if len(initialism) >= PROGRAM_ABBREVIATION_MIN_LENGTH:
+        return initialism
+    return ''
+
+
+def _program_initialism_base(value: str) -> str:
+    cleaned = re.sub(r'\([^)]*\)', ' ', value or '')
+    cleaned = re.sub(r'\*+', ' ', cleaned)
+    return _clean_display_text(cleaned)
+
+
+def _program_initialism_candidates() -> dict[str, set[str]]:
+    candidates: dict[str, set[str]] = {}
+    for program_title in _known_program_candidates():
+        initialism = _program_initialism(program_title)
+        if initialism:
+            candidates.setdefault(initialism, set()).add(_clean_display_text(program_title))
+    return candidates
+
+
+def _extract_program_abbreviation_from_text(text: str) -> str:
+    normalized_text = _normalize_lookup_text(text)
+    if not normalized_text:
+        return ''
+
+    for pattern, program_title in EXPLICIT_PROGRAM_ABBREVIATIONS:
+        if pattern.search(normalized_text):
+            return program_title
+
+    matches: list[tuple[str, str]] = []
+    for initialism, program_titles in _program_initialism_candidates().items():
+        base_titles = {
+            _program_initialism_base(program_title)
+            for program_title in program_titles
+            if _program_initialism_base(program_title)
+        }
+        normalized_base_titles = {_normalize_lookup_text(title) for title in base_titles}
+        if len(normalized_base_titles) != 1:
+            continue
+        if _question_mentions_alias(normalized_text, initialism):
+            matches.append((initialism, min(base_titles, key=len)))
+    if matches:
+        _initialism, program_title = max(
+            matches,
+            key=lambda item: (len(item[0]), len(_normalize_lookup_text(item[1]))),
+        )
+        return program_title
+    return ''
+
+
 def _program_lookup_terms(program_title: str) -> set[str]:
     terms = {_clean_display_text(program_title)}
     for alias in _build_scope_aliases(program_title):
@@ -473,6 +556,8 @@ def _question_has_explicit_scope(question: str) -> bool:
     if _is_dentistry_query(question):
         return True
     if _extract_question_scope_hints(question):
+        return True
+    if _extract_program_abbreviation_from_text(question):
         return True
     return bool(_extract_known_program_from_text(question))
 
@@ -664,6 +749,23 @@ def _is_department_head_query(question: str) -> bool:
     return bool(DEPARTMENT_HEAD_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
 
+def _requested_staff_role(question: str) -> str:
+    normalized_question = _normalize_lookup_text(question)
+    if _is_department_head_query(question):
+        return 'department_head'
+    if DEPUTY_DEAN_QUERY_PATTERN.search(normalized_question):
+        return 'deputy_dean'
+    if DEAN_QUERY_PATTERN.search(normalized_question):
+        return 'dean'
+    if DIRECTOR_QUERY_PATTERN.search(normalized_question):
+        return 'director'
+    return ''
+
+
+def _is_role_specific_staff_query(question: str) -> bool:
+    return bool(_requested_staff_role(question))
+
+
 def _is_program_exists_query(question: str) -> bool:
     return bool(PROGRAM_EXISTS_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
@@ -688,6 +790,14 @@ def _is_fee_query(question: str) -> bool:
     return bool(FEE_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
 
+def _fee_program_title(question: str) -> str:
+    return (
+        _extract_program_abbreviation_from_text(question)
+        or _extract_known_program_from_text(question)
+        or _extract_program_hint_from_text(question)
+    )
+
+
 def _is_rank_query(question: str) -> bool:
     return bool(RANK_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
@@ -702,6 +812,105 @@ def _is_quota_query(question: str) -> bool:
 
 def _is_course_query(question: str) -> bool:
     return bool(COURSE_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
+def _course_program_candidates() -> set[str]:
+    titles = (
+        ContentChunk.objects.filter(page__is_active=True)
+        .filter(
+            Q(metadata__chunk_level='program_overview')
+            | Q(metadata__chunk_level='semester_plan')
+            | Q(metadata__record_type='bologna_program_overview')
+            | Q(metadata__record_type='bologna_semester_plan')
+        )
+        .exclude(metadata__program_title='')
+        .values_list('metadata__program_title', flat=True)
+        .distinct()
+    )
+    return {_clean_display_text(title) for title in titles if title}
+
+
+def _extract_course_program_from_text(text: str) -> str:
+    normalized_text = _normalize_lookup_text(text)
+    if not normalized_text:
+        return ''
+    matches: list[str] = []
+    for title in _course_program_candidates():
+        base_title = _program_initialism_base(title)
+        aliases = _build_scope_aliases(title) | _build_scope_aliases(base_title)
+        if any(_question_mentions_alias(normalized_text, alias) for alias in aliases):
+            matches.append(title)
+    if not matches:
+        return ''
+
+    wants_english = _mentions_english(text)
+    if wants_english:
+        english_matches = [
+            title for title in matches if _mentions_english(title)
+        ]
+        if english_matches:
+            matches = english_matches
+    else:
+        non_english_matches = [
+            title for title in matches if not _mentions_english(title)
+        ]
+        if non_english_matches:
+            matches = non_english_matches
+
+    return min(matches, key=lambda title: (len(_normalize_lookup_text(title)), title))
+
+
+def _course_program_title(question: str) -> str:
+    return (
+        _extract_program_abbreviation_from_text(question)
+        or _extract_course_program_from_text(question)
+        or _extract_known_program_from_text(question)
+        or _extract_program_hint_from_text(question)
+    )
+
+
+def _requested_course_period_number(question: str) -> int | None:
+    normalized_question = _normalize_lookup_text(question)
+    match = re.search(r'\b([1-8])\s*(?:yar[ıi]y[ıi]l|donem|dönem|semester)\b', normalized_question)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'\b(?:yar[ıi]y[ıi]l|donem|dönem|semester)\s*([1-8])\b', normalized_question)
+    if match:
+        return int(match.group(1))
+    ordinal_map = {
+        'birinci': 1,
+        'ikinci': 2,
+        'ucuncu': 3,
+        'dorduncu': 4,
+        'besinci': 5,
+        'altinci': 6,
+        'yedinci': 7,
+        'sekizinci': 8,
+    }
+    for word, period_number in ordinal_map.items():
+        if re.search(rf'\b{word}\s+(?:yar[ıi]y[ıi]l|donem|dönem|semester)\b', normalized_question):
+            return period_number
+    return None
+
+
+def _requested_class_number(question: str) -> int | None:
+    normalized_question = _normalize_lookup_text(question)
+    match = re.search(r'\b([1-8])\s*(?:sınıf|sinif)\b', normalized_question)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'\b(?:sınıf|sinif)\s*([1-8])\b', normalized_question)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _is_full_course_list_query(question: str) -> bool:
+    return bool(COURSE_FULL_LIST_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
+def _mentions_english(value: str) -> bool:
+    normalized = _normalize_lookup_text(value)
+    return 'ingilizce' in normalized or 'i ngilizce' in normalized
 
 
 def _question_topics(question: str) -> set[str]:
@@ -757,7 +966,11 @@ def _chunk_priority(question: str, chunk: ContentChunk) -> int:
         staff_count = 0
 
     if _is_staff_query(question):
+        if record_type == 'staff_role_assignment' or kind == 'main_site_role_page':
+            return 0
         if record_type == 'academic_staff_member':
+            if _is_role_specific_staff_query(question):
+                return 4
             return 0
         if record_type == 'department_head_message':
             return 0
@@ -801,10 +1014,18 @@ def _chunk_priority(question: str, chunk: ContentChunk) -> int:
         return 5
 
     if _is_course_query(question):
+        requested_period = _requested_course_period_number(question)
         if chunk_level == 'semester_plan':
-            return 0
+            period_number = _get_chunk_metadata_value(chunk, 'period_number')
+            if requested_period is not None and str(period_number) == str(requested_period):
+                return 0
+            if requested_period is None and _is_full_course_list_query(question):
+                return 1
+            if requested_period is None:
+                return 2
+            return 3
         if chunk_level == 'program_overview':
-            return 1
+            return 0 if requested_period is None else 1
         if kind == 'bologna_program_page':
             return 2
         return 5
@@ -831,11 +1052,23 @@ def _sort_candidate_chunks(question: str, chunks: list[ContentChunk]) -> list[Co
 
 def _filter_candidates_for_query(question: str, chunks: list[ContentChunk]) -> list[ContentChunk]:
     if _is_staff_query(question):
+        role_chunks = [
+            chunk
+            for chunk in chunks
+            if _get_chunk_metadata_value(chunk, 'kind') == 'main_site_role_page'
+            or _get_chunk_metadata_value(chunk, 'record_type')
+            in {'department_head_message', 'staff_role_assignment'}
+        ]
+        if _is_role_specific_staff_query(question) and role_chunks:
+            return role_chunks
+
         staff_chunks = [
             chunk
             for chunk in chunks
-            if _get_chunk_metadata_value(chunk, 'kind') in {'bologna_staff_page', 'main_site_staff_page'}
-            or _get_chunk_metadata_value(chunk, 'record_type') in {'academic_staff_member', 'department_head_message'}
+            if _get_chunk_metadata_value(chunk, 'kind')
+            in {'bologna_staff_page', 'main_site_staff_page', 'main_site_role_page'}
+            or _get_chunk_metadata_value(chunk, 'record_type')
+            in {'academic_staff_member', 'department_head_message', 'staff_role_assignment'}
         ]
         if staff_chunks:
             return staff_chunks
@@ -874,7 +1107,7 @@ def _filter_candidates_for_query(question: str, chunks: list[ContentChunk]) -> l
             or _get_chunk_metadata_value(chunk, 'period_label')
         ]
         if filtered:
-            return filtered
+            return sorted(filtered, key=lambda chunk: _course_sort_key(question, chunk))
 
     question_topics = _question_topics(question)
     if question_topics:
@@ -1000,16 +1233,69 @@ def _build_structured_score_answer(question: str, chunks: list[ContentChunk]) ->
     return '\n'.join(lines)
 
 
+def _chunk_has_fee_amount(chunk: ContentChunk) -> bool:
+    return any(
+        _get_chunk_metadata_value(chunk, key)
+        for key in ('fee_full', 'fee_25', 'fee_50', 'fee_kav_support')
+    )
+
+
+def _chunk_matches_program_title(chunk: ContentChunk, program_title: str) -> bool:
+    if not program_title:
+        return False
+    searchable_text = ' '.join(
+        value
+        for value in (
+            _get_chunk_metadata_value(chunk, 'program_title'),
+            _get_chunk_metadata_value(chunk, 'placement_label'),
+            _get_chunk_metadata_value(chunk, 'unit_name'),
+            _get_chunk_metadata_value(chunk, 'program_alias_text'),
+            chunk.page.title,
+            chunk.text[:1000],
+        )
+        if value
+    )
+    return any(
+        _normalized_contains(searchable_text, term)
+        for term in _program_lookup_terms(program_title)
+    )
+
+
+def _sort_fee_chunks(chunks: list[ContentChunk]) -> list[ContentChunk]:
+    return sorted(
+        chunks,
+        key=lambda item: (
+            _get_chunk_metadata_value(item, 'program_title') or item.page.title,
+            item.page.title,
+        ),
+    )
+
+
+def _fee_chunks_for_answer(question: str, chunks: list[ContentChunk]) -> list[ContentChunk]:
+    fee_chunks = [
+        chunk
+        for chunk in chunks
+        if (
+            _get_chunk_metadata_value(chunk, 'kind') == 'structured_admissions_fee'
+            or _get_chunk_metadata_value(chunk, 'record_type') == 'tuition_fee'
+        )
+        and _chunk_has_fee_amount(chunk)
+    ]
+    program_title = _fee_program_title(question)
+    if program_title:
+        scoped_chunks = [
+            chunk for chunk in fee_chunks if _chunk_matches_program_title(chunk, program_title)
+        ]
+        if scoped_chunks:
+            fee_chunks = scoped_chunks
+    return _sort_fee_chunks(fee_chunks)
+
+
 def _build_structured_fee_answer(question: str, chunks: list[ContentChunk]) -> str:
     if not _is_fee_query(question):
         return ''
 
-    fee_chunks = [
-        chunk
-        for chunk in chunks
-        if _get_chunk_metadata_value(chunk, 'kind') == 'structured_admissions_fee'
-        or _get_chunk_metadata_value(chunk, 'record_type') == 'tuition_fee'
-    ]
+    fee_chunks = _fee_chunks_for_answer(question, chunks)
     if not fee_chunks:
         return ''
 
@@ -1024,13 +1310,7 @@ def _build_structured_fee_answer(question: str, chunks: list[ContentChunk]) -> s
         intro = 'Resmi öğrenim ücreti bilgileri:'
 
     lines = [intro]
-    for chunk in sorted(
-        fee_chunks,
-        key=lambda item: (
-            _get_chunk_metadata_value(item, 'program_title') or item.page.title,
-            item.page.title,
-        ),
-    ):
+    for chunk in fee_chunks:
         label = _get_chunk_metadata_value(chunk, 'program_title') or chunk.page.title
         metrics: list[str] = []
         for title, key in (
@@ -1050,6 +1330,292 @@ def _build_structured_fee_answer(question: str, chunks: list[ContentChunk]) -> s
         if not metrics:
             metrics.append('ücret bilgisi kaynakta yer almıyor')
         lines.append(f'- {_clean_display_text(label)}: {", ".join(metrics)}.')
+    return '\n'.join(lines)
+
+
+def _is_course_chunk(chunk: ContentChunk) -> bool:
+    return (
+        _get_chunk_metadata_value(chunk, 'chunk_level') in {'program_overview', 'semester_plan'}
+        or _get_chunk_metadata_value(chunk, 'record_type')
+        in {'bologna_program_overview', 'bologna_semester_plan'}
+    )
+
+
+def _course_curriculum_year(chunk: ContentChunk) -> int:
+    try:
+        return int(_get_chunk_metadata_value(chunk, 'curriculum_year') or 0)
+    except ValueError:
+        return 0
+
+
+def _latest_course_year(chunks: list[ContentChunk]) -> int:
+    return max((_course_curriculum_year(chunk) for chunk in chunks), default=0)
+
+
+def _course_sort_key(question: str, chunk: ContentChunk) -> tuple[int, int, str]:
+    requested_period = _requested_course_period_number(question)
+    requested_class = _requested_class_number(question)
+    chunk_level = _get_chunk_metadata_value(chunk, 'chunk_level')
+    period_number_text = _get_chunk_metadata_value(chunk, 'period_number')
+    try:
+        period_number = int(period_number_text) if period_number_text else 99
+    except ValueError:
+        period_number = 99
+
+    if requested_period is not None and period_number == requested_period:
+        priority = 0
+    elif requested_class is not None:
+        semester_1 = 2 * requested_class - 1
+        semester_2 = 2 * requested_class
+        if period_number in (semester_1, semester_2, requested_class):
+            priority = 0
+        elif chunk_level == 'program_overview':
+            priority = 1
+        elif chunk_level == 'semester_plan':
+            priority = 2
+        else:
+            priority = 3
+    elif chunk_level == 'program_overview':
+        priority = 0 if requested_period is None else 1
+    elif chunk_level == 'semester_plan':
+        priority = 1 if _is_full_course_list_query(question) else 2
+    else:
+        priority = 3
+    return priority, period_number, chunk.page.title
+
+
+def _course_chunks_for_answer(question: str, chunks: list[ContentChunk]) -> list[ContentChunk]:
+    course_chunks = [chunk for chunk in chunks if _is_course_chunk(chunk)]
+    if not course_chunks:
+        return []
+
+    program_title = _course_program_title(question)
+    if program_title:
+        scoped_chunks = [
+            chunk for chunk in course_chunks if _chunk_matches_program_title(chunk, program_title)
+        ]
+        if scoped_chunks:
+            course_chunks = scoped_chunks
+        normalized_program_title = _normalize_lookup_text(program_title)
+        exact_chunks = [
+            chunk
+            for chunk in course_chunks
+            if _normalize_lookup_text(_get_chunk_metadata_value(chunk, 'program_title'))
+            == normalized_program_title
+        ]
+        if not exact_chunks:
+            exact_chunks = [
+                chunk
+                for chunk in course_chunks
+                if _normalize_lookup_text(
+                    _program_initialism_base(_get_chunk_metadata_value(chunk, 'program_title'))
+                )
+                == normalized_program_title
+            ]
+        if exact_chunks:
+            course_chunks = exact_chunks
+
+        wants_english = _mentions_english(program_title)
+        non_english_chunks = [
+            chunk
+            for chunk in course_chunks
+            if not _mentions_english(_get_chunk_metadata_value(chunk, 'program_title'))
+        ]
+        if not wants_english and non_english_chunks:
+            course_chunks = non_english_chunks
+
+    latest_year = _latest_course_year(course_chunks)
+    if latest_year:
+        course_chunks = [
+            chunk for chunk in course_chunks if _course_curriculum_year(chunk) == latest_year
+        ]
+
+    requested_period = _requested_course_period_number(question)
+    if requested_period is not None:
+        semester_chunks = [
+            chunk
+            for chunk in course_chunks
+            if _get_chunk_metadata_value(chunk, 'chunk_level') == 'semester_plan'
+            and _get_chunk_metadata_value(chunk, 'period_number') == str(requested_period)
+        ]
+        if semester_chunks:
+            return sorted(semester_chunks, key=lambda chunk: chunk.page.title)
+
+    requested_class = _requested_class_number(question)
+    if requested_class is not None:
+        samples = [chunk for chunk in course_chunks
+                    if _get_chunk_metadata_value(chunk, 'chunk_level') == 'semester_plan']
+        first_label = _normalize_lookup_text(
+            _get_chunk_metadata_value(samples[0], 'period_label') if samples else ''
+        )
+        uses_class_labels = bool(first_label and re.search(r'\bs(ı|i)n(ı|i)f\b', first_label))
+
+        if uses_class_labels:
+            class_chunks = [
+                chunk
+                for chunk in course_chunks
+                if _get_chunk_metadata_value(chunk, 'chunk_level') == 'semester_plan'
+                and _get_chunk_metadata_value(chunk, 'period_number') == str(requested_class)
+            ]
+            if class_chunks:
+                return sorted(class_chunks, key=lambda chunk: chunk.page.title)
+        else:
+            semester_1 = 2 * requested_class - 1
+            semester_2 = 2 * requested_class
+            class_chunks = [
+                chunk
+                for chunk in course_chunks
+                if _get_chunk_metadata_value(chunk, 'chunk_level') == 'semester_plan'
+                and _get_chunk_metadata_value(chunk, 'period_number') in (str(semester_1), str(semester_2))
+            ]
+            if class_chunks:
+                return sorted(
+                    class_chunks,
+                    key=lambda chunk: int(_get_chunk_metadata_value(chunk, 'period_number') or '0'),
+                )
+
+    return sorted(course_chunks, key=lambda chunk: _course_sort_key(question, chunk))
+
+
+def _metadata_number(chunk: ContentChunk, key: str) -> str:
+    value = _get_chunk_metadata_value(chunk, key)
+    return value if value else ''
+
+
+def _overview_summary_lines(chunk: ContentChunk) -> list[str]:
+    lines: list[str] = []
+    course_count = _metadata_number(chunk, 'course_count')
+    period_count = _metadata_number(chunk, 'period_count')
+    total_ects = _metadata_number(chunk, 'total_ects_sum')
+    if period_count:
+        lines.append(f'Dönem sayısı: {period_count}')
+    if course_count:
+        lines.append(f'Toplam ders sayısı: {course_count}')
+    if total_ects:
+        lines.append(f'Toplam AKTS: {total_ects}')
+
+    for raw_line in chunk.text.splitlines():
+        line = _clean_display_text(raw_line)
+        if re.search(r'^\-\s*\d+\.\s*yar[ıi]y[ıi]l\s+ders\s+plan[ıi]\s*:', line, flags=re.IGNORECASE):
+            lines.append(line)
+    return lines
+
+
+def _semester_course_lines(chunk: ContentChunk) -> list[str]:
+    lines = []
+    for raw_line in chunk.text.splitlines():
+        line = _clean_display_text(raw_line)
+        if line.startswith('- '):
+            lines.append(line)
+    return lines
+
+
+def _build_structured_course_answer(question: str, chunks: list[ContentChunk]) -> str:
+    if not _is_course_query(question):
+        return ''
+
+    course_chunks = _course_chunks_for_answer(question, chunks)
+    if not course_chunks:
+        program_title = _course_program_title(question)
+        if program_title:
+            return f'{program_title} için doğrulanmış ders planı kaynağı bulamadım.'
+        return ''
+
+    first_chunk = course_chunks[0]
+    program_title = _clean_display_text(
+        _get_chunk_metadata_value(first_chunk, 'program_title') or first_chunk.page.title
+    )
+    curriculum_year = _get_chunk_metadata_value(first_chunk, 'curriculum_year')
+    requested_period = _requested_course_period_number(question)
+    requested_class = _requested_class_number(question)
+
+    if requested_period is not None:
+        semester_chunk = next(
+            (
+                chunk
+                for chunk in course_chunks
+                if _get_chunk_metadata_value(chunk, 'chunk_level') == 'semester_plan'
+            ),
+            first_chunk,
+        )
+        period_label = _clean_display_text(
+            _get_chunk_metadata_value(semester_chunk, 'period_label')
+            or _get_chunk_metadata_value(semester_chunk, 'section_title')
+            or f'{requested_period}. Yarıyıl Ders Planı'
+        )
+        lines = [
+            f'{program_title} {curriculum_year} müfredatında {period_label} dersleri:'
+        ]
+        course_lines = _semester_course_lines(semester_chunk)
+        if not course_lines:
+            return f'{program_title} için {period_label} ders listesi kaynakta yer almıyor.'
+        lines.extend(course_lines)
+        return '\n'.join(lines)
+
+    if requested_class is not None:
+        first_label = _normalize_lookup_text(
+            _get_chunk_metadata_value(course_chunks[0], 'period_label') or ''
+        )
+        uses_class_labels = bool(first_label and re.search(r'\bs(ı|i)n(ı|i)f\b', first_label))
+
+        if uses_class_labels:
+            chunk = course_chunks[0]
+            period_label = _clean_display_text(
+                _get_chunk_metadata_value(chunk, 'period_label')
+                or f'{requested_class}. Sınıf Ders Planı'
+            )
+            lines = [f'{program_title} {curriculum_year} müfredatında {period_label} dersleri:']
+            course_lines = _semester_course_lines(chunk)
+            if course_lines:
+                lines.extend(course_lines)
+            else:
+                return f'{program_title} için {period_label} ders listesi kaynakta yer almıyor.'
+            return '\n'.join(lines)
+        else:
+            lines = [f'{program_title} {curriculum_year} müfredatında {requested_class}. Sınıf dersleri:']
+            for chunk in course_chunks:
+                period_label = _clean_display_text(
+                    _get_chunk_metadata_value(chunk, 'period_label')
+                    or _get_chunk_metadata_value(chunk, 'section_title')
+                )
+                if period_label:
+                    lines.append(f'\n{period_label}:')
+                lines.extend(_semester_course_lines(chunk))
+            return '\n'.join(lines)
+
+    overview_chunk = next(
+        (
+            chunk
+            for chunk in course_chunks
+            if _get_chunk_metadata_value(chunk, 'chunk_level') == 'program_overview'
+        ),
+        course_chunks[0],
+    )
+    if _is_full_course_list_query(question):
+        lines = [f'{program_title} {curriculum_year} müfredatındaki dersler:']
+        semester_chunks = [
+            chunk
+            for chunk in course_chunks
+            if _get_chunk_metadata_value(chunk, 'chunk_level') == 'semester_plan'
+        ]
+        if not semester_chunks:
+            semester_chunks = [overview_chunk]
+        for semester_chunk in semester_chunks:
+            period_label = _clean_display_text(
+                _get_chunk_metadata_value(semester_chunk, 'period_label')
+                or _get_chunk_metadata_value(semester_chunk, 'section_title')
+            )
+            if period_label:
+                lines.append(period_label)
+            lines.extend(_semester_course_lines(semester_chunk))
+        return '\n'.join(lines)
+
+    lines = [f'{program_title} {curriculum_year} müfredat özeti:']
+    summary_lines = _overview_summary_lines(overview_chunk)
+    if summary_lines:
+        lines.extend(f'- {line.lstrip("- ").strip()}' for line in summary_lines)
+    else:
+        lines.append('- Ders planı özeti kaynakta yer alıyor; dönem detayları için yarıyıl belirtebilirsin.')
     return '\n'.join(lines)
 
 
@@ -1135,31 +1701,156 @@ def _staff_program_title(chunk: ContentChunk) -> str:
     return _clean_display_text(program_title)
 
 
+def _looks_like_person_label(value: str) -> bool:
+    label = _clean_display_text(value)
+    lowered = _normalize_lookup_text(label)
+    if not label or any(char.isdigit() for char in label):
+        return False
+    if any(
+        token in lowered
+        for token in (
+            'akademik',
+            'bolumu',
+            'fakultesi',
+            'genetik',
+            'kadro',
+            'mesaji',
+            'muhendisligi',
+            'programi',
+            'universitesi',
+            'yonetimi',
+            'yuksekokulu',
+        )
+    ):
+        return False
+    words = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü'’.-]+", label)
+    if len(words) < 2 or len(words) > 8:
+        return False
+    return sum(1 for word in words if word and word[0].isupper()) >= 2
+
+
+def _metadata_person_label(chunk: ContentChunk) -> str:
+    scope_values = {
+        _normalize_lookup_text(value)
+        for value in (
+            _get_chunk_metadata_value(chunk, 'program_title'),
+            _get_chunk_metadata_value(chunk, 'unit_name'),
+            _get_chunk_metadata_value(chunk, 'faculty'),
+            _get_chunk_metadata_value(chunk, 'section_title'),
+            chunk.page.title,
+        )
+        if value
+    }
+    for key in ('entity_label', 'entity_name', 'staff_name'):
+        label = _clean_display_text(_get_chunk_metadata_value(chunk, key))
+        if not label:
+            continue
+        if _normalize_lookup_text(label) in scope_values:
+            continue
+        if _looks_like_person_label(label):
+            return label
+    return ''
+
+
+def _extract_department_head_label(chunk: ContentChunk) -> str:
+    patterns = (
+        r'bölüm\s*başkan[ıi]?\s*[-:]\s*([^|/\n\r]+)',
+        r'bolum\s*baskan[ıi]?\s*[-:]\s*([^|/\n\r]+)',
+        r'([^|/\n\r]+?)\s*[-:]\s*bölüm\s*başkan[ıi]?\b',
+        r'([^|/\n\r]+?)\s*[-:]\s*bolum\s*baskan[ıi]?\b',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, chunk.text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        label = _clean_display_text(match.group(1).strip(' -:'))
+        if _looks_like_person_label(label):
+            return label
+    return _metadata_person_label(chunk)
+
+
+def _role_assignments_from_chunk(chunk: ContentChunk) -> list[tuple[str, str]]:
+    assignments: list[tuple[str, str]] = []
+    metadata_role = _clean_display_text(_get_chunk_metadata_value(chunk, 'role'))
+    metadata_name = _clean_display_text(
+        _get_chunk_metadata_value(chunk, 'entity_name')
+        or _get_chunk_metadata_value(chunk, 'staff_name')
+    )
+    if metadata_role and _looks_like_person_label(metadata_name):
+        assignments.append((metadata_role, metadata_name))
+
+    for line in re.split(r'\n+', chunk.text):
+        role_match = re.search(r'(?:^|\|)\s*rol\s*:\s*([^|\n\r]+)', line, flags=re.IGNORECASE)
+        name_match = re.search(r'(?:^|\|)\s*isim\s*:\s*([^|\n\r]+)', line, flags=re.IGNORECASE)
+        if not role_match or not name_match:
+            continue
+        role = _clean_display_text(role_match.group(1))
+        name = _clean_display_text(name_match.group(1))
+        if role and _looks_like_person_label(name):
+            assignments.append((role, name))
+    return list(dict.fromkeys(assignments))
+
+
+def _role_matches_question(role: str, requested_role: str) -> bool:
+    normalized_role = _normalize_lookup_text(role)
+    if requested_role == 'department_head':
+        return 'bolum baskan' in normalized_role
+    if requested_role == 'deputy_dean':
+        return 'dekan' in normalized_role and 'yardimc' in normalized_role
+    if requested_role == 'dean':
+        return 'dekan' in normalized_role and 'yardimc' not in normalized_role
+    if requested_role == 'director':
+        return 'mudur' in normalized_role and 'yardimc' not in normalized_role
+    return False
+
+
+def _role_scope_title(chunk: ContentChunk, requested_role: str) -> str:
+    if requested_role in {'dean', 'deputy_dean'}:
+        scope = _get_chunk_metadata_value(chunk, 'faculty') or _get_chunk_metadata_value(chunk, 'program_title')
+    else:
+        scope = _get_chunk_metadata_value(chunk, 'program_title') or _get_chunk_metadata_value(chunk, 'unit_name')
+    scope = scope or _get_chunk_metadata_value(chunk, 'faculty') or chunk.page.title.split(' - ', 1)[0]
+    scope = _clean_display_text(re.sub(r'\s+(yönetimi|yonetimi)$', '', scope, flags=re.IGNORECASE))
+    return scope
+
+
+def _build_role_specific_staff_answer(question: str, chunks: list[ContentChunk]) -> str:
+    requested_role = _requested_staff_role(question)
+    if not requested_role:
+        return ''
+
+    if requested_role == 'department_head':
+        for chunk in chunks:
+            if _get_chunk_metadata_value(chunk, 'record_type') != 'department_head_message':
+                continue
+            label = _extract_department_head_label(chunk)
+            if label:
+                program_title = _staff_program_title(chunk)
+                return f'{program_title} bölüm başkanı {label} olarak görünüyor.'
+
+    role_labels = {
+        'department_head': 'bölüm başkanı',
+        'dean': 'dekanı',
+        'deputy_dean': 'dekan yardımcısı',
+        'director': 'müdürü',
+    }
+    for chunk in chunks:
+        for role, name in _role_assignments_from_chunk(chunk):
+            if not _role_matches_question(role, requested_role):
+                continue
+            scope = _role_scope_title(chunk, requested_role)
+            return f'{scope} {role_labels[requested_role]} {name} olarak görünüyor.'
+
+    return 'Bu rol için doğrulanmış yönetici kaynağı bulamadım.'
+
+
 def _build_structured_staff_answer(question: str, chunks: list[ContentChunk]) -> str:
     if not _is_staff_query(question):
         return ''
 
-    if _is_department_head_query(question):
-        for chunk in chunks:
-            if _get_chunk_metadata_value(chunk, 'record_type') != 'department_head_message':
-                continue
-
-            label = _clean_display_text(
-                _get_chunk_metadata_value(chunk, 'entity_label')
-                or _get_chunk_metadata_value(chunk, 'entity_name')
-            )
-            if not label:
-                match = re.search(
-                    r'bölüm\s*başkan[ıi]?\s*[-:]\s*([^|\n\r]+)',
-                    chunk.text,
-                    flags=re.IGNORECASE,
-                )
-                label = _clean_display_text(match.group(1)) if match else ''
-            if not label:
-                continue
-
-            program_title = _staff_program_title(chunk)
-            return f'{program_title} bölüm başkanı {label} olarak görünüyor.'
+    role_answer = _build_role_specific_staff_answer(question, chunks)
+    if role_answer:
+        return role_answer
 
     staff_chunks = _staff_member_chunks_for_context(chunks)
     if not staff_chunks:
@@ -1249,7 +1940,11 @@ def _build_program_presence_answer(question: str, chunks: list[ContentChunk]) ->
             )
         return 'İndekslenmiş resmi kaynaklarda Diş Hekimliği programı bulamadım.'
 
-    program_title = _extract_known_program_from_text(question) or _extract_program_hint_from_text(question)
+    program_title = (
+        _extract_program_abbreviation_from_text(question)
+        or _extract_known_program_from_text(question)
+        or _extract_program_hint_from_text(question)
+    )
     if not program_title:
         return ''
 
@@ -1594,6 +2289,7 @@ def _retrieve_direct_staff_chunks(question: str, limit: int) -> list[ContentChun
         program_lookup |= (
             Q(metadata__program_title__icontains=term)
             | Q(metadata__unit_name__icontains=term)
+            | Q(metadata__faculty__icontains=term)
             | Q(metadata__program_alias_text__icontains=term)
             | Q(page__title__icontains=term)
             | Q(text__icontains=term)
@@ -1604,9 +2300,11 @@ def _retrieve_direct_staff_chunks(question: str, limit: int) -> list[ContentChun
         .filter(page__is_active=True)
         .filter(
             Q(metadata__kind='main_site_staff_page')
+            | Q(metadata__kind='main_site_role_page')
             | Q(metadata__kind='bologna_staff_page')
             | Q(metadata__record_type='academic_staff_member')
             | Q(metadata__record_type='department_head_message')
+            | Q(metadata__record_type='staff_role_assignment')
         )
         .filter(program_lookup)
         .order_by('page_id', 'chunk_index')
@@ -1644,6 +2342,71 @@ def _retrieve_direct_program_chunks(question: str, limit: int) -> list[ContentCh
     return list(queryset[:limit])
 
 
+def _retrieve_direct_fee_chunks(question: str, limit: int) -> list[ContentChunk]:
+    if not _is_fee_query(question):
+        return []
+
+    program_title = _fee_program_title(question)
+    if not program_title:
+        return []
+
+    program_lookup = Q()
+    for term in _program_lookup_terms(program_title):
+        program_lookup |= (
+            Q(metadata__program_title__icontains=term)
+            | Q(metadata__placement_label__icontains=term)
+            | Q(metadata__unit_name__icontains=term)
+            | Q(metadata__program_alias_text__icontains=term)
+            | Q(page__title__icontains=term)
+            | Q(text__icontains=term)
+        )
+
+    queryset = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(Q(metadata__kind='structured_admissions_fee') | Q(metadata__record_type='tuition_fee'))
+        .filter(program_lookup)
+        .order_by('page_id', 'chunk_index')
+    )
+    return [chunk for chunk in queryset[:limit] if _chunk_has_fee_amount(chunk)]
+
+
+def _retrieve_direct_course_chunks(question: str, limit: int) -> list[ContentChunk]:
+    if not _is_course_query(question):
+        return []
+
+    program_title = _course_program_title(question)
+    if not program_title:
+        return []
+
+    program_lookup = Q()
+    for term in _program_lookup_terms(program_title):
+        program_lookup |= (
+            Q(metadata__program_title__icontains=term)
+            | Q(metadata__program_alias_text__icontains=term)
+            | Q(metadata__unit_name__icontains=term)
+            | Q(metadata__faculty__icontains=term)
+            | Q(page__title__icontains=term)
+            | Q(text__icontains=term)
+        )
+
+    queryset = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(
+            Q(metadata__chunk_level='program_overview')
+            | Q(metadata__chunk_level='semester_plan')
+            | Q(metadata__record_type='bologna_program_overview')
+            | Q(metadata__record_type='bologna_semester_plan')
+        )
+        .filter(program_lookup)
+    )
+    return sorted(
+        list(queryset[: limit * 3]),
+        key=lambda chunk: (-_course_curriculum_year(chunk), _course_sort_key(question, chunk)),
+    )[:limit]
+
+
 def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[ContentChunk]:
     candidate_limit = max(settings.RAG_RETRIEVE_LIMIT * CANDIDATE_LIMIT_MULTIPLIER, settings.RAG_RETRIEVE_LIMIT)
     candidate_per_page_limit = max(
@@ -1662,12 +2425,24 @@ def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[Co
     )
     direct_chunks = _retrieve_direct_staff_chunks(
         question, limit=candidate_limit * 2
-    ) + _retrieve_direct_program_chunks(question, limit=candidate_limit)
+    ) + _retrieve_direct_program_chunks(
+        question, limit=candidate_limit
+    ) + _retrieve_direct_fee_chunks(
+        question, limit=candidate_limit
+    ) + _retrieve_direct_course_chunks(question, limit=candidate_limit * 2)
     combined = _sort_candidate_chunks(question, direct_chunks + vector_chunks + keyword_chunks)
     combined = _filter_candidates_for_query(question, combined)
+    if _is_course_query(question):
+        combined = sorted(combined, key=lambda chunk: _course_sort_key(question, chunk))
     scoped_chunks, had_scope = _apply_scope_filter(question, combined)
     if had_scope and not scoped_chunks:
         scoped_chunks = combined
+    if _is_course_query(question):
+        return _limit_chunks(
+            scoped_chunks,
+            limit=settings.RAG_RETRIEVE_LIMIT * 3,
+            per_page_limit=settings.RAG_PER_PAGE_LIMIT * 9,
+        )
     return _limit_chunks(
         scoped_chunks,
         limit=settings.RAG_RETRIEVE_LIMIT,
@@ -1737,13 +2512,14 @@ def _prepare_chat_context(question: str, conversation: Conversation) -> dict:
     timings['embed_ms'] = _elapsed_ms(embed_start)
 
     retrieve_start = perf_counter()
-    chunks = _retrieve_candidates(resolved_question, query_embedding)
+    all_chunks = _retrieve_candidates(resolved_question, query_embedding)
     timings['retrieve_ms'] = _elapsed_ms(retrieve_start)
     prompt = ''
     prompt_chars = 0
     prompt_start = perf_counter()
-    if chunks:
-        prompt, chunks = build_prompt(resolved_question, chunks)
+    prompt_chunks: list[ContentChunk] = []
+    if all_chunks:
+        prompt, prompt_chunks = build_prompt(resolved_question, all_chunks)
         prompt_chars = len(prompt)
     timings['prompt_ms'] = _elapsed_ms(prompt_start)
 
@@ -1751,8 +2527,9 @@ def _prepare_chat_context(question: str, conversation: Conversation) -> dict:
         'key': key,
         'timings': timings,
         'cached_payload': None,
-        'chunks': chunks,
-        'sources': build_sources(chunks),
+        'chunks': prompt_chunks,
+        'retrieved_chunks': all_chunks,
+        'sources': build_sources(prompt_chunks),
         'prompt': prompt,
         'prompt_chars': prompt_chars,
         'resolved_question': resolved_question,
@@ -1765,6 +2542,28 @@ def _sse_event(event: str, payload: dict) -> str:
 
 def _sse_done() -> str:
     return f'data: {SSE_DONE_SENTINEL}\n\n'
+
+
+def _structured_sources(question: str, answer: str, chunks: list[ContentChunk]) -> list[dict] | None:
+    if answer and _is_fee_query(question):
+        fee_chunks = _fee_chunks_for_answer(question, chunks)
+        if fee_chunks:
+            return build_sources(fee_chunks)
+    if answer and _is_course_query(question):
+        course_chunks = _course_chunks_for_answer(question, chunks)
+        if course_chunks:
+            if (_requested_course_period_number(question) is None
+                    and _requested_class_number(question) is None
+                    and not _is_full_course_list_query(question)):
+                overview_chunks = [
+                    chunk
+                    for chunk in course_chunks
+                    if _get_chunk_metadata_value(chunk, 'chunk_level') == 'program_overview'
+                ]
+                if overview_chunks:
+                    return build_sources(overview_chunks[:1])
+            return build_sources(course_chunks)
+    return None
 
 
 @transaction.atomic
@@ -1801,6 +2600,7 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
         }
 
     chunks = context['chunks']
+    retrieved_chunks = context['retrieved_chunks']
     prompt = context['prompt']
     prompt_chars = context['prompt_chars']
     llm_busy = False
@@ -1808,17 +2608,22 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
         answer = NO_CONTEXT_ANSWER
         timings['llm_ms'] = 0.0
     else:
-        structured_answer = _build_structured_staff_answer(resolved_question, chunks)
+        structured_answer = _build_structured_staff_answer(resolved_question, retrieved_chunks)
         if not structured_answer:
-            structured_answer = _build_program_presence_answer(resolved_question, chunks)
+            structured_answer = _build_program_presence_answer(resolved_question, retrieved_chunks)
         if not structured_answer:
-            structured_answer = _build_structured_score_answer(resolved_question, chunks)
+            structured_answer = _build_structured_score_answer(resolved_question, retrieved_chunks)
         if not structured_answer:
-            structured_answer = _build_structured_fee_answer(resolved_question, chunks)
+            structured_answer = _build_structured_fee_answer(resolved_question, retrieved_chunks)
         if not structured_answer:
-            structured_answer = _build_general_info_answer(resolved_question, chunks)
+            structured_answer = _build_structured_course_answer(resolved_question, retrieved_chunks)
+        if not structured_answer:
+            structured_answer = _build_general_info_answer(resolved_question, retrieved_chunks)
         if structured_answer:
             answer = structured_answer
+            structured_sources = _structured_sources(resolved_question, answer, retrieved_chunks)
+            if structured_sources is not None:
+                sources = structured_sources
             timings['llm_ms'] = 0.0
         else:
             llm_start = perf_counter()
@@ -1907,23 +2712,29 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
             return
 
         chunks = context['chunks']
+        retrieved_chunks = context['retrieved_chunks']
         answer = NO_CONTEXT_ANSWER
         llm_busy = False
         if not chunks:
             timings['llm_ms'] = 0.0
             yield _sse_event('token', {'text': answer})
         else:
-            structured_answer = _build_structured_staff_answer(resolved_question, chunks)
+            structured_answer = _build_structured_staff_answer(resolved_question, retrieved_chunks)
             if not structured_answer:
-                structured_answer = _build_program_presence_answer(resolved_question, chunks)
+                structured_answer = _build_program_presence_answer(resolved_question, retrieved_chunks)
             if not structured_answer:
-                structured_answer = _build_structured_score_answer(resolved_question, chunks)
+                structured_answer = _build_structured_score_answer(resolved_question, retrieved_chunks)
             if not structured_answer:
-                structured_answer = _build_structured_fee_answer(resolved_question, chunks)
+                structured_answer = _build_structured_fee_answer(resolved_question, retrieved_chunks)
             if not structured_answer:
-                structured_answer = _build_general_info_answer(resolved_question, chunks)
+                structured_answer = _build_structured_course_answer(resolved_question, retrieved_chunks)
+            if not structured_answer:
+                structured_answer = _build_general_info_answer(resolved_question, retrieved_chunks)
             if structured_answer:
                 answer = structured_answer
+                structured_sources = _structured_sources(resolved_question, answer, retrieved_chunks)
+                if structured_sources is not None:
+                    sources = structured_sources
                 timings['llm_ms'] = 0.0
                 yield _sse_event('token', {'text': answer})
             else:

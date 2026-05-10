@@ -204,7 +204,7 @@ class ChatServiceTests(TestCase):
         key_b = cache_key('  psikoloji   bölümü 5 yarıyıl ders planı  ')
 
         self.assertEqual(key_a, key_b)
-        self.assertTrue(key_a.startswith('chat-answer:v8:'))
+        self.assertTrue(key_a.startswith('chat-answer:v12:'))
 
     @override_settings(RAG_MAX_CHUNK_CHARS=20, RAG_MAX_CONTEXT_CHARS=155)
     def test_build_prompt_trims_context_and_limits_used_chunks(self):
@@ -536,10 +536,11 @@ class ChatServiceTests(TestCase):
         head_chunk = ContentChunk.objects.create(
             page=head_page,
             chunk_index=0,
-            text='Bölüm Başkanı - Prof. Dr. Ahmet Bulut',
+            text='Bölüm Başkanının Mesajı / Bölüm Başkanı - Prof. Dr. Ahmet Bulut / Sevgili öğrenciler',
             metadata={
                 'record_type': 'department_head_message',
                 'program_title': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Bilgisayar Mühendisliği',
                 'section_title': 'Bölüm Başkanının Mesajı',
             },
         )
@@ -815,7 +816,161 @@ class ChatServiceTests(TestCase):
 
         results = _retrieve_candidates('Hemşirelik 3. yarıyıl dersler', [0.1, 0.2])
 
-        self.assertEqual(results, [semester_chunk, overview_chunk])
+        self.assertEqual(set(results), {semester_chunk, overview_chunk})
+
+    @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context', return_value=[])
+    def test_retrieve_candidates_directly_loads_course_chunks_for_program_queries(
+        self,
+        _retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+    ):
+        overview_page = WebPage.objects.create(
+            url='https://example.com/mbg-overview',
+            source='bologna',
+            title='Moleküler Biyoloji ve Genetik (İngilizce) - Program Özeti',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-mbg-overview',
+        )
+        semester_page = WebPage.objects.create(
+            url='https://example.com/mbg-semester-1',
+            source='bologna',
+            title='Moleküler Biyoloji ve Genetik (İngilizce) - 1.Yarıyıl Ders Planı',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-mbg-semester-1',
+        )
+        overview_chunk = ContentChunk.objects.create(
+            page=overview_page,
+            chunk_index=0,
+            text='Program: Moleküler Biyoloji ve Genetik (İngilizce)\nToplam Ders Sayısı: 44',
+            metadata={
+                'program_title': 'Moleküler Biyoloji ve Genetik (İngilizce)',
+                'record_type': 'bologna_program_overview',
+                'chunk_level': 'program_overview',
+                'curriculum_year': '2025',
+                'course_count': 44,
+            },
+        )
+        semester_chunk = ContentChunk.objects.create(
+            page=semester_page,
+            chunk_index=0,
+            text='- MBG 101 Moleküler Biyolojiye Giriş | AKTS: 6',
+            metadata={
+                'program_title': 'Moleküler Biyoloji ve Genetik (İngilizce)',
+                'record_type': 'bologna_semester_plan',
+                'chunk_level': 'semester_plan',
+                'curriculum_year': '2025',
+                'period_number': 1,
+                'period_label': '1.Yarıyıl Ders Planı',
+            },
+        )
+
+        results = _retrieve_candidates('mbg dersleri', [0.1, 0.2])
+
+        self.assertEqual(results, [overview_chunk, semester_chunk])
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context', return_value=[])
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_structured_course_summary_without_llm(
+        self,
+        _embed_query_mock,
+        _retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        overview_page = WebPage.objects.create(
+            url='https://example.com/cse-overview',
+            source='bologna',
+            title='Bilgisayar Mühendisliği (İngilizce) - Program Özeti',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-cse-overview',
+        )
+        ContentChunk.objects.create(
+            page=overview_page,
+            chunk_index=0,
+            text=(
+                'Program: Bilgisayar Mühendisliği (İngilizce)\n'
+                'Müfredat Yılı: 2025\n'
+                'Dönem Sayısı: 8\n'
+                'Toplam Ders Sayısı: 46\n'
+                'Toplam AKTS: 251\n'
+                '- 1.Yarıyıl Ders Planı: 31 AKTS\n'
+                '- 2.Yarıyıl Ders Planı: 31 AKTS'
+            ),
+            metadata={
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+                'program_alias_text': 'Bilgisayar Mühendisliği',
+                'record_type': 'bologna_program_overview',
+                'chunk_level': 'program_overview',
+                'curriculum_year': '2025',
+                'period_count': 8,
+                'course_count': 46,
+                'total_ects_sum': 251,
+            },
+        )
+
+        payload = chat('bilgisayar mühendisliği dersleri')
+
+        self.assertIn(
+            'Bilgisayar Mühendisliği (İngilizce) 2025 müfredat özeti:',
+            payload['answer'],
+        )
+        self.assertIn('- Dönem sayısı: 8', payload['answer'])
+        self.assertIn('- Toplam ders sayısı: 46', payload['answer'])
+        self.assertIn('- Toplam AKTS: 251', payload['answer'])
+        self.assertIn('- 1.Yarıyıl Ders Planı: 31 AKTS', payload['answer'])
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context', return_value=[])
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_structured_course_semester_without_llm(
+        self,
+        _embed_query_mock,
+        _retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        semester_page = WebPage.objects.create(
+            url='https://example.com/hemsirelik-semester-3',
+            source='bologna',
+            title='Hemşirelik - 3.Yarıyıl Ders Planı',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-hemsirelik-semester-3',
+        )
+        ContentChunk.objects.create(
+            page=semester_page,
+            chunk_index=0,
+            text=(
+                'Program: Hemşirelik\n'
+                'Dönem: 3.Yarıyıl Ders Planı\n'
+                '- HEM 301 İç Hastalıkları Hemşireliği | AKTS: 6 | Saat: 3+2+0 | Zorunlu\n'
+                '- HEM 303 Cerrahi Hastalıkları Hemşireliği | AKTS: 6 | Saat: 3+2+0 | Zorunlu'
+            ),
+            metadata={
+                'program_title': 'Hemşirelik',
+                'record_type': 'bologna_semester_plan',
+                'chunk_level': 'semester_plan',
+                'curriculum_year': '2025',
+                'period_number': 3,
+                'period_label': '3.Yarıyıl Ders Planı',
+            },
+        )
+
+        payload = chat('hemşirelik 3. yarıyıl dersleri')
+
+        self.assertIn('Hemşirelik 2025 müfredatında 3.Yarıyıl Ders Planı dersleri:', payload['answer'])
+        self.assertIn('HEM 301 İç Hastalıkları Hemşireliği', payload['answer'])
+        self.assertIn('HEM 303 Cerrahi Hastalıkları Hemşireliği', payload['answer'])
+        generate_answer_mock.assert_not_called()
 
     @patch('chat.services.generate_answer', return_value='LLM cevabı')
     @patch('chat.services.retrieve_keyword_context', return_value=[])
@@ -999,6 +1154,335 @@ class ChatServiceTests(TestCase):
         self.assertNotIn('**', payload['answer'])
         self.assertNotIn('tıklayın', payload['answer'])
         self.assertIn('Ek destek vardır.', payload['answer'])
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_resolves_pc_muh_fee_to_computer_engineering(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        engineering_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-muhendisligi-fee',
+            source='structured',
+            title='Bilgisayar Mühendisliği (İngilizce)** - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-pc-muh-fee',
+        )
+        engineering_chunk = ContentChunk.objects.create(
+            page=engineering_page,
+            chunk_index=0,
+            text='Ücretli: 675.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)**',
+                'fee_full': '675.000₺',
+                'fee_25': '506.250₺',
+            },
+        )
+        programming_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-programciligi-fee',
+            source='structured',
+            title='Bilgisayar Programcılığı - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-pc-programming-fee',
+        )
+        programming_chunk = ContentChunk.objects.create(
+            page=programming_page,
+            chunk_index=0,
+            text='Ücretli: 225.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Bilgisayar Programcılığı',
+                'fee_full': '225.000₺',
+            },
+        )
+        sociology_page = WebPage.objects.create(
+            url='https://example.com/sosyoloji-fee',
+            source='structured',
+            title='Sosyoloji - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-sosyoloji-fee',
+        )
+        sociology_chunk = ContentChunk.objects.create(
+            page=sociology_page,
+            chunk_index=0,
+            text='Ücretli: 365.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Sosyoloji',
+                'fee_full': '365.000₺',
+            },
+        )
+        retrieve_context_mock.return_value = [sociology_chunk, programming_chunk]
+
+        payload = chat('pc müh ücreti')
+
+        self.assertIn('Bilgisayar Mühendisliği (İngilizce) için resmi öğrenim ücreti bilgileri:', payload['answer'])
+        self.assertIn('ücretli 675.000₺', payload['answer'])
+        self.assertNotIn('Sosyoloji', payload['answer'])
+        self.assertNotIn('Bilgisayar Programcılığı', payload['answer'])
+        self.assertEqual(len(payload['sources']), 1)
+        self.assertEqual(payload['sources'][0]['title'], engineering_page.title)
+        generate_answer_mock.assert_not_called()
+
+        cache.clear()
+        retrieve_context_mock.return_value = [programming_chunk, sociology_chunk]
+
+        payload = chat('pc müh bölümü ücreti')
+
+        self.assertIn('Bilgisayar Mühendisliği (İngilizce) için resmi öğrenim ücreti bilgileri:', payload['answer'])
+        self.assertNotIn('Sosyoloji', payload['answer'])
+        self.assertNotIn('Bilgisayar Programcılığı', payload['answer'])
+        self.assertEqual(payload['sources'][0]['title'], engineering_page.title)
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_resolves_program_initialism_fee(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        mbg_page = WebPage.objects.create(
+            url='https://example.com/mbg-fee',
+            source='structured',
+            title='Moleküler Biyoloji ve Genetik (İngilizce)** - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-mbg-fee',
+        )
+        mbg_chunk = ContentChunk.objects.create(
+            page=mbg_page,
+            chunk_index=0,
+            text='Ücretli: 675.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Moleküler Biyoloji ve Genetik (İngilizce)**',
+                'fee_full': '675.000₺',
+                'fee_25': '506.250₺',
+            },
+        )
+        mbg_score_page = WebPage.objects.create(
+            url='https://example.com/mbg-score',
+            source='structured',
+            title='Moleküler Biyoloji ve Genetik (İngilizce) (Burslu) - Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-mbg-score',
+        )
+        ContentChunk.objects.create(
+            page=mbg_score_page,
+            chunk_index=0,
+            text='Taban puan: 500',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'program_title': 'Moleküler Biyoloji ve Genetik (İngilizce)',
+                'placement_label': 'Moleküler Biyoloji ve Genetik (İngilizce) (Burslu)',
+            },
+        )
+        ContentChunk.objects.create(
+            page=mbg_score_page,
+            chunk_index=1,
+            text='Taban puan: 450',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'program_title': 'Moleküler Biyoloji ve Genetik (İngilizce)',
+                'placement_label': 'Moleküler Biyoloji ve Genetik (İngilizce) (%50 İndirimli)',
+            },
+        )
+        sociology_page = WebPage.objects.create(
+            url='https://example.com/initialism-sosyoloji-fee',
+            source='structured',
+            title='Sosyoloji - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-initialism-sosyoloji-fee',
+        )
+        sociology_chunk = ContentChunk.objects.create(
+            page=sociology_page,
+            chunk_index=0,
+            text='Ücretli: 365.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Sosyoloji',
+                'fee_full': '365.000₺',
+            },
+        )
+        retrieve_context_mock.return_value = [sociology_chunk]
+
+        payload = chat('mbg ücreti')
+
+        self.assertIn('Moleküler Biyoloji ve Genetik (İngilizce) için resmi öğrenim ücreti bilgileri:', payload['answer'])
+        self.assertIn('ücretli 675.000₺', payload['answer'])
+        self.assertNotIn('Sosyoloji', payload['answer'])
+        self.assertEqual(payload['sources'][0]['title'], mbg_page.title)
+        generate_answer_mock.assert_not_called()
+
+        cache.clear()
+        retrieve_context_mock.return_value = [mbg_chunk]
+
+        payload = chat('Moleküler Biyoloji ve Genetik ücreti')
+
+        self.assertIn('Moleküler Biyoloji ve Genetik (İngilizce) için resmi öğrenim ücreti bilgileri:', payload['answer'])
+        self.assertNotIn('Sosyoloji', payload['answer'])
+        self.assertEqual(payload['sources'][0]['title'], mbg_page.title)
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_keeps_bilgisayar_programciligi_fee(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        engineering_page = WebPage.objects.create(
+            url='https://example.com/programcilik-guard-engineering-fee',
+            source='structured',
+            title='Bilgisayar Mühendisliği (İngilizce)** - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-programcilik-guard-engineering-fee',
+        )
+        engineering_chunk = ContentChunk.objects.create(
+            page=engineering_page,
+            chunk_index=0,
+            text='Ücretli: 675.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)**',
+                'fee_full': '675.000₺',
+            },
+        )
+        programming_page = WebPage.objects.create(
+            url='https://example.com/programcilik-guard-fee',
+            source='structured',
+            title='Bilgisayar Programcılığı - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-programcilik-guard-fee',
+        )
+        programming_chunk = ContentChunk.objects.create(
+            page=programming_page,
+            chunk_index=0,
+            text='Ücretli: 225.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Bilgisayar Programcılığı',
+                'fee_full': '225.000₺',
+            },
+        )
+        retrieve_context_mock.return_value = [engineering_chunk]
+
+        payload = chat('Bilgisayar Programcılığı ücreti')
+
+        self.assertIn('Bilgisayar Programcılığı için resmi öğrenim ücreti bilgileri:', payload['answer'])
+        self.assertIn('ücretli 225.000₺', payload['answer'])
+        self.assertNotIn('Bilgisayar Mühendisliği', payload['answer'])
+        self.assertEqual(payload['sources'][0]['title'], programming_page.title)
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_fee_sources_follow_answer_order_and_skip_empty_fee_chunks(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        programming_page = WebPage.objects.create(
+            url='https://example.com/source-order-programming-fee',
+            source='structured',
+            title='Bilgisayar Programcılığı - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-source-order-programming-fee',
+        )
+        programming_chunk = ContentChunk.objects.create(
+            page=programming_page,
+            chunk_index=0,
+            text='Ücretli: 225.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Bilgisayar Programcılığı',
+                'fee_full': '225.000₺',
+            },
+        )
+        engineering_page = WebPage.objects.create(
+            url='https://example.com/source-order-engineering-fee',
+            source='structured',
+            title='Bilgisayar Mühendisliği (İngilizce)** - Öğrenim Ücreti',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-source-order-engineering-fee',
+        )
+        engineering_chunk = ContentChunk.objects.create(
+            page=engineering_page,
+            chunk_index=0,
+            text='Ücretli: 675.000₺',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)**',
+                'fee_full': '675.000₺',
+            },
+        )
+        generic_page = WebPage.objects.create(
+            url='https://example.com/generic-fee-page',
+            source='main_site',
+            title='Lisans/Ön Lisans Öğrenim Ücretleri 2025-2026',
+            content_text='Genel ücret sayfası',
+            raw_html='{}',
+            content_hash='hash-generic-fee-page',
+        )
+        generic_chunk = ContentChunk.objects.create(
+            page=generic_page,
+            chunk_index=0,
+            text='Lisans/Ön Lisans Öğrenim Ücretleri',
+            metadata={
+                'kind': 'structured_admissions_fee',
+                'record_type': 'tuition_fee',
+                'program_title': '',
+            },
+        )
+        retrieve_context_mock.return_value = [programming_chunk, engineering_chunk, generic_chunk]
+
+        payload = chat('öğrenim ücreti bilgileri')
+
+        self.assertLess(
+            payload['answer'].find('- Bilgisayar Mühendisliği'),
+            payload['answer'].find('- Bilgisayar Programcılığı'),
+        )
+        self.assertNotIn('ücret bilgisi kaynakta yer almıyor', payload['answer'])
+        self.assertEqual(
+            [source['title'] for source in payload['sources']],
+            [engineering_page.title, programming_page.title],
+        )
         generate_answer_mock.assert_not_called()
 
     @patch('chat.services.generate_answer')
@@ -1561,6 +2045,112 @@ class ChatServiceTests(TestCase):
         self.assertEqual(
             payload['answer'],
             'Bilgisayar Mühendisliği bölüm başkanı Prof. Dr. Ahmet Bulut olarak görünüyor.',
+        )
+        self.assertNotIn('akademik kadro kaynağında', payload['answer'])
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_returns_dean_from_role_page_without_academic_staff_list(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        role_page = WebPage.objects.create(
+            url='https://example.com/tip-fakultesi-yonetimi',
+            source='main_site',
+            title='Tıp Fakültesi Yönetimi',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-tip-role',
+        )
+        role_chunk = ContentChunk.objects.create(
+            page=role_page,
+            chunk_index=0,
+            text='Birim: Tıp Fakültesi\nTıp Fakültesi yönetim | rol: Dekan | isim: Prof. Dr. Nadi Bakırcı',
+            metadata={
+                'kind': 'main_site_role_page',
+                'record_type': 'staff_role_assignment',
+                'faculty': 'Tıp Fakültesi',
+                'program_title': 'Tıp Fakültesi Yönetimi',
+                'section_title': 'Tıp Fakültesi Yönetimi',
+            },
+        )
+        staff_page = WebPage.objects.create(
+            url='https://example.com/tip-akademik-kadro',
+            source='main_site',
+            title='Tıp Fakültesi - Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-tip-staff',
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Tıp Fakültesi akademik kadro | isim: Bora Özveren | unvan: Doç. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'faculty': 'Tıp Fakültesi',
+                'entity_name': 'Bora Özveren',
+                'staff_title': 'Doç. Dr.',
+                'staff_count': 249,
+            },
+        )
+        retrieve_context_mock.return_value = [staff_chunk]
+
+        payload = chat('Tıp fakültesi dekanı kim?')
+
+        self.assertEqual(
+            payload['answer'],
+            'Tıp Fakültesi dekanı Prof. Dr. Nadi Bakırcı olarak görünüyor.',
+        )
+        self.assertNotIn('akademik kadro kaynağında', payload['answer'])
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_role_specific_staff_query_does_not_return_staff_list_without_role_source(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/tip-akademik-kadro-only',
+            source='main_site',
+            title='Tıp Fakültesi - Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-tip-staff-only',
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Tıp Fakültesi akademik kadro | isim: Bora Özveren | unvan: Doç. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'faculty': 'Tıp Fakültesi',
+                'entity_name': 'Bora Özveren',
+                'staff_title': 'Doç. Dr.',
+                'staff_count': 249,
+            },
+        )
+        retrieve_context_mock.return_value = [staff_chunk]
+
+        payload = chat('Tıp fakültesi dekanı kim?')
+
+        self.assertEqual(
+            payload['answer'],
+            'Bu rol için doğrulanmış yönetici kaynağı bulamadım.',
         )
         self.assertNotIn('akademik kadro kaynağında', payload['answer'])
         generate_answer_mock.assert_not_called()
