@@ -204,7 +204,7 @@ class ChatServiceTests(TestCase):
         key_b = cache_key('  psikoloji   bölümü 5 yarıyıl ders planı  ')
 
         self.assertEqual(key_a, key_b)
-        self.assertTrue(key_a.startswith('chat-answer:v7:'))
+        self.assertTrue(key_a.startswith('chat-answer:v8:'))
 
     @override_settings(RAG_MAX_CHUNK_CHARS=20, RAG_MAX_CONTEXT_CHARS=155)
     def test_build_prompt_trims_context_and_limits_used_chunks(self):
@@ -1504,11 +1504,11 @@ class ChatServiceTests(TestCase):
 
         self.assertEqual(result, [score_chunk])
 
-    @patch('chat.services.generate_answer', return_value='Başkan: Prof. Dr. Ahmet')
+    @patch('chat.services.generate_answer')
     @patch('chat.services.retrieve_keyword_context', return_value=[])
     @patch('chat.services.retrieve_context')
     @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
-    def test_chat_finds_staff_chunks_for_baskan_query(
+    def test_chat_returns_department_head_without_academic_staff_list(
         self,
         _embed_query_mock,
         retrieve_context_mock,
@@ -1533,12 +1533,37 @@ class ChatServiceTests(TestCase):
                 'section_title': 'Bölüm Başkanının Mesajı',
             },
         )
-        retrieve_context_mock.return_value = [head_chunk]
+        staff_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-akademik-kadro',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-staff-for-head',
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Ahmet Bulut',
+                'staff_title': 'Prof. Dr.',
+                'staff_count': 1,
+            },
+        )
+        retrieve_context_mock.return_value = [staff_chunk]
 
         payload = chat('Bilgisayar mühendisliği bölüm başkanı kimdir?')
 
-        generate_answer_mock.assert_called_once()
-        self.assertEqual(payload['answer'], 'Başkan: Prof. Dr. Ahmet')
+        self.assertEqual(
+            payload['answer'],
+            'Bilgisayar Mühendisliği bölüm başkanı Prof. Dr. Ahmet Bulut olarak görünüyor.',
+        )
+        self.assertNotIn('akademik kadro kaynağında', payload['answer'])
+        generate_answer_mock.assert_not_called()
 
 
 class WarmModelsCommandTests(TestCase):

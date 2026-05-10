@@ -31,7 +31,7 @@ LLM_BUSY_ANSWER = (
     'Lütfen birkaç saniye sonra tekrar deneyin.'
 )
 QUESTION_HASH_LENGTH = 12
-CACHE_KEY_VERSION = 'v7'
+CACHE_KEY_VERSION = 'v8'
 CANDIDATE_LIMIT_MULTIPLIER = 3
 SSE_DONE_SENTINEL = '[DONE]'
 STAFF_QUERY_PATTERN = re.compile(
@@ -61,6 +61,9 @@ STAFF_QUERY_PATTERN = re.compile(
 )
 STAFF_COUNT_QUERY_PATTERN = re.compile(
     r'\b(kaç|kac|ne\s*kadar|say[ıi]s[ıi]|adet|tane)\b'
+)
+DEPARTMENT_HEAD_QUERY_PATTERN = re.compile(
+    r'\b(bölüm\s*başkan\w*|bolum\s*baskan\w*)\b'
 )
 PROGRAM_EXISTS_QUERY_PATTERN = re.compile(
     r'\b(var\s*m[ıi]|bulunuyor\s*mu|mevcut\s*mu|aç[ıi]k\s*m[ıi])\b'
@@ -657,6 +660,10 @@ def _is_staff_list_query(question: str) -> bool:
     return bool(re.search(r'\b(kimler|listele\w*|adlar[ıi]|isimler[ıi])\b', normalized_question))
 
 
+def _is_department_head_query(question: str) -> bool:
+    return bool(DEPARTMENT_HEAD_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
 def _is_program_exists_query(question: str) -> bool:
     return bool(PROGRAM_EXISTS_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
@@ -1132,6 +1139,28 @@ def _build_structured_staff_answer(question: str, chunks: list[ContentChunk]) ->
     if not _is_staff_query(question):
         return ''
 
+    if _is_department_head_query(question):
+        for chunk in chunks:
+            if _get_chunk_metadata_value(chunk, 'record_type') != 'department_head_message':
+                continue
+
+            label = _clean_display_text(
+                _get_chunk_metadata_value(chunk, 'entity_label')
+                or _get_chunk_metadata_value(chunk, 'entity_name')
+            )
+            if not label:
+                match = re.search(
+                    r'bölüm\s*başkan[ıi]?\s*[-:]\s*([^|\n\r]+)',
+                    chunk.text,
+                    flags=re.IGNORECASE,
+                )
+                label = _clean_display_text(match.group(1)) if match else ''
+            if not label:
+                continue
+
+            program_title = _staff_program_title(chunk)
+            return f'{program_title} bölüm başkanı {label} olarak görünüyor.'
+
     staff_chunks = _staff_member_chunks_for_context(chunks)
     if not staff_chunks:
         staff_count_chunks = [
@@ -1577,6 +1606,7 @@ def _retrieve_direct_staff_chunks(question: str, limit: int) -> list[ContentChun
             Q(metadata__kind='main_site_staff_page')
             | Q(metadata__kind='bologna_staff_page')
             | Q(metadata__record_type='academic_staff_member')
+            | Q(metadata__record_type='department_head_message')
         )
         .filter(program_lookup)
         .order_by('page_id', 'chunk_index')
