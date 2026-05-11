@@ -269,3 +269,11 @@ docker compose down -v
 docker compose up --build -d
 docker compose --profile bootstrap run --rm bootstrap
 ```
+
+## Experimental Branch Features
+
+Bu branch üzerinde, ilk açılış (first-start) scraper süreci için bazı deneysel backend araçları değerlendirilmektedir:
+
+- `utils/sanitizer.py`: Scrape edilen JSONL kayıtlarındaki Türkçe karakter kodlama hatalarını (örn. Windows-1254) düzeltmek ve başlıklardaki fazla boşlukları temizlemek için kullanılan bir metin temizleme aracıdır.
+- `scripts/mapping_tool.py`: `academic_staff_member` kayıtlarını analiz ederek, her bir üniversite departmanını kendi akademik kadrosu (fakülte üyeleri) ile eşleştirir ve sonucu `staff_map_debug.json` olarak kaydeder.
+
