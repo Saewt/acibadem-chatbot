@@ -269,3 +269,13 @@ docker compose down -v
 docker compose up --build -d
 docker compose --profile bootstrap run --rm bootstrap
 ```
+
+## Deneysel Özellikler(windows-first-start-scraper-update branch)
+Projenin veri işleme kabiliyetlerini artırmak amacıyla `windows-first-start-scraper-update` dalında denenen özellikler: 
+
+### 1. Veri Doğrulama ve Sanitization (utils/)
+- **UTF-8 Standardizasyonu:** Türkçe karakterlerin (İ, ş, ğ, ü, ö, ç) JSONL çıktılarında bozulmasını engelleyen encoding katmanı.
+- **Data Integrity Check:** Scraper çıktılarının şema bütünlüğünü kontrol eden `validator.py` modülü.
+
+### 2. Bilgi Grafiği Eşleştirme (Mapping)
+- **Akademik Personel Haritalama:** `sources.jsonl` üzerindeki departman verilerini personel unvanlarıyla ilişkilendiren deneysel mapping aracı.
