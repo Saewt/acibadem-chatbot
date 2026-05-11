@@ -176,6 +176,31 @@ TOPIC_KEYWORDS = {
 }
 
 
+GREETING_WORDS = frozenset({
+    'merhaba', 'selam', 'hello', 'selamlar', 'hey', 'hi', 'slm', 'merhabalar'
+})
+STATE_WORDS = frozenset({
+    'naber', 'nasılsın', 'nasilsin', 'ne haber'
+})
+TEST_WORDS = frozenset({
+    'test', 'deneme'
+})
+
+
+def _get_greeting_response(question: str) -> str | None:
+    import string
+    normalized = ' '.join(question.lower().strip().split())
+    normalized = normalized.translate(str.maketrans('', '', string.punctuation))
+    
+    if normalized in GREETING_WORDS:
+        return 'Merhaba, sorularınızı sorabilirsiniz.'
+    if normalized in STATE_WORDS:
+        return 'İyiyim, teşekkürler! Sana nasıl yardımcı olabilirim?'
+    if normalized in TEST_WORDS:
+        return 'Sistem aktif. Sorularınızı sorabilirsiniz.'
+    return None
+
+
 class ConversationNotFoundError(Exception):
     pass
 
@@ -2407,6 +2432,20 @@ def _retrieve_direct_course_chunks(question: str, limit: int) -> list[ContentChu
     )[:limit]
 
 
+def _reciprocal_rank_fusion(*chunk_lists: list[ContentChunk], k: int = 60) -> list[ContentChunk]:
+    scores = {}
+    chunk_map = {}
+    for chunk_list in chunk_lists:
+        for rank, chunk in enumerate(chunk_list):
+            if chunk.id not in scores:
+                scores[chunk.id] = 0.0
+                chunk_map[chunk.id] = chunk
+            scores[chunk.id] += 1.0 / (k + rank)
+            
+    sorted_items = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return [chunk_map[chunk_id] for chunk_id, _ in sorted_items]
+
+
 def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[ContentChunk]:
     candidate_limit = max(settings.RAG_RETRIEVE_LIMIT * CANDIDATE_LIMIT_MULTIPLIER, settings.RAG_RETRIEVE_LIMIT)
     candidate_per_page_limit = max(
@@ -2423,6 +2462,8 @@ def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[Co
         limit=candidate_limit,
         per_page_limit=candidate_per_page_limit,
     )
+    hybrid_chunks = _reciprocal_rank_fusion(vector_chunks, keyword_chunks)
+
     direct_chunks = _retrieve_direct_staff_chunks(
         question, limit=candidate_limit * 2
     ) + _retrieve_direct_program_chunks(
@@ -2430,7 +2471,7 @@ def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[Co
     ) + _retrieve_direct_fee_chunks(
         question, limit=candidate_limit
     ) + _retrieve_direct_course_chunks(question, limit=candidate_limit * 2)
-    combined = _sort_candidate_chunks(question, direct_chunks + vector_chunks + keyword_chunks)
+    combined = _sort_candidate_chunks(question, direct_chunks + hybrid_chunks)
     combined = _filter_candidates_for_query(question, combined)
     if _is_course_query(question):
         combined = sorted(combined, key=lambda chunk: _course_sort_key(question, chunk))
@@ -2570,6 +2611,19 @@ def _structured_sources(question: str, answer: str, chunks: list[ContentChunk]) 
 def chat(question: str, conversation_id: int | None = None) -> dict:
     overall_start = perf_counter()
     conversation = get_conversation(conversation_id, question)
+
+    greeting_response = _get_greeting_response(question)
+    if greeting_response:
+        answer = greeting_response
+        _persist_exchange(conversation, question, answer)
+        return {
+            'answer': answer,
+            'conversation_id': conversation.id,
+            'sources': [],
+            'cached': False,
+            'busy': False,
+        }
+
     context = _prepare_chat_context(question, conversation)
     resolved_question = context['resolved_question']
     question_hash = _question_hash(resolved_question)
@@ -2676,6 +2730,15 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
                 'cached': False,
             },
         )
+
+        greeting_response = _get_greeting_response(question)
+        if greeting_response:
+            answer = greeting_response
+            yield _sse_event('token', {'text': answer})
+            _persist_exchange(conversation, question, answer)
+            yield _sse_event('sources', {'sources': []})
+            yield _sse_done()
+            return
 
         context = _prepare_chat_context(question, conversation)
         resolved_question = context['resolved_question']
