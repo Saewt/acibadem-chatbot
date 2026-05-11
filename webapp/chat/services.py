@@ -177,15 +177,28 @@ TOPIC_KEYWORDS = {
 
 
 GREETING_WORDS = frozenset({
-    'merhaba', 'selam', 'hello', 'selamlar', 'hey', 'hi', 'merhabalar'
+    'merhaba', 'selam', 'hello', 'selamlar', 'hey', 'hi', 'slm', 'merhabalar'
+})
+STATE_WORDS = frozenset({
+    'naber', 'nasılsın', 'nasilsin', 'ne haber'
+})
+TEST_WORDS = frozenset({
+    'test', 'deneme'
 })
 
 
-def _is_greeting(question: str) -> bool:
+def _get_greeting_response(question: str) -> str | None:
     import string
     normalized = ' '.join(question.lower().strip().split())
     normalized = normalized.translate(str.maketrans('', '', string.punctuation))
-    return normalized in GREETING_WORDS
+    
+    if normalized in GREETING_WORDS:
+        return 'Merhaba, sorularınızı sorabilirsiniz.'
+    if normalized in STATE_WORDS:
+        return 'İyiyim, teşekkürler! Sana nasıl yardımcı olabilirim?'
+    if normalized in TEST_WORDS:
+        return 'Sistem aktif. Sorularınızı sorabilirsiniz.'
+    return None
 
 
 class ConversationNotFoundError(Exception):
@@ -2599,8 +2612,9 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
     overall_start = perf_counter()
     conversation = get_conversation(conversation_id, question)
 
-    if _is_greeting(question):
-        answer = 'Merhaba, sorularınızı sorabilirsiniz.'
+    greeting_response = _get_greeting_response(question)
+    if greeting_response:
+        answer = greeting_response
         _persist_exchange(conversation, question, answer)
         return {
             'answer': answer,
@@ -2717,8 +2731,9 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
             },
         )
 
-        if _is_greeting(question):
-            answer = 'Merhaba, sorularınızı sorabilirsiniz.'
+        greeting_response = _get_greeting_response(question)
+        if greeting_response:
+            answer = greeting_response
             yield _sse_event('token', {'text': answer})
             _persist_exchange(conversation, question, answer)
             yield _sse_event('sources', {'sources': []})
