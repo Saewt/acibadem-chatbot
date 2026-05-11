@@ -4,32 +4,7 @@
 
 {% block content %}
 <main class="chat-app">
-    <aside class="chat-sidebar">
-        <div class="chat-sidebar-head">
-            <p class="sidebar-eyebrow">Conversation History</p>
-            <h1 class="chat-sidebar-title">ACU Asistan</h1>
-            <p class="chat-sidebar-note">Son 20 konuşma listeleniyor.</p>
-        </div>
 
-        <ul class="conversation-list">
-            {% for conversation in conversations %}
-                <li>
-                    <button
-                        type="button"
-                        class="conversation-item"
-                        data-conversation-id="{{ conversation.id }}"
-                    >
-                        <span class="conversation-title">{{ conversation.title|default:"Yeni konuşma" }}</span>
-                        <span class="conversation-date">{{ conversation.created_at|date:"d.m.Y H:i" }}</span>
-                    </button>
-                </li>
-            {% empty %}
-                <li class="conversation-empty">Henüz kayıtlı konuşma yok.</li>
-            {% endfor %}
-        </ul>
-
-        <button type="button" id="new-chat-btn" class="new-chat-btn">+ Yeni sohbet</button>
-    </aside>
 
     <section class="chat-main">
         <header class="chat-header">
