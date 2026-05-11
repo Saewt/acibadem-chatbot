@@ -15,11 +15,17 @@ from .services import (
     LLMBusyError,
     NO_CONTEXT_ANSWER,
     _extract_question_scope_hints,
+    _expanded_query_terms,
     _filter_candidates_for_query,
     _is_dentistry_query,
+    _is_staff_count_query,
+    _is_staff_list_query,
     _is_staff_query,
+    _question_topics,
     _resolve_question_with_conversation,
     _retrieve_candidates,
+    _retrieve_direct_facility_chunks,
+    _retrieve_direct_staff_chunks,
     build_prompt,
     build_sources,
     cache_key,
@@ -65,7 +71,7 @@ class ChatServiceTests(TestCase):
     @override_settings(
         LLM_BACKEND='ollama',
         LLM_BASE_URL='http://host.docker.internal:11434/v1',
-        LLM_MODEL='qwen3:4b',
+        LLM_MODEL='qwen3:8b',
         LLM_MAX_TOKENS=512,
         LLM_TIMEOUT=12,
         LLM_THINK=True,
@@ -89,7 +95,7 @@ class ChatServiceTests(TestCase):
             'http://host.docker.internal:11434/api/chat',
         )
         body = post_mock.call_args.kwargs['json']
-        self.assertEqual(body['model'], 'qwen3:4b')
+        self.assertEqual(body['model'], 'qwen3:8b')
         self.assertEqual(body['think'], True)
         self.assertEqual(body['options']['num_predict'], 512)
         response_mock.raise_for_status.assert_called_once()
@@ -204,7 +210,7 @@ class ChatServiceTests(TestCase):
         key_b = cache_key('  psikoloji   bölümü 5 yarıyıl ders planı  ')
 
         self.assertEqual(key_a, key_b)
-        self.assertTrue(key_a.startswith('chat-answer:v12:'))
+        self.assertTrue(key_a.startswith('chat-answer:v15:'))
 
     @override_settings(RAG_MAX_CHUNK_CHARS=20, RAG_MAX_CONTEXT_CHARS=155)
     def test_build_prompt_trims_context_and_limits_used_chunks(self):
@@ -232,6 +238,67 @@ class ChatServiceTests(TestCase):
         self.assertIn('Icerik: ' + ('A' * 19) + '…', prompt)
         self.assertNotIn('Icerik: ' + ('B' * 19) + '…', prompt)
         self.assertEqual(used_chunks, [chunk_a])
+
+    @override_settings(RAG_MAX_CHUNK_CHARS=30, RAG_MAX_CONTEXT_CHARS=190)
+    def test_build_prompt_expands_context_for_facility_queries(self):
+        page = WebPage.objects.create(
+            url='https://example.com/kutuphane',
+            source='main_site',
+            title='Kütüphane',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-library',
+        )
+        chunk_a = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Kütüphane koleksiyonu ve çalışma alanları hakkında bilgi.',
+        )
+        chunk_b = ContentChunk.objects.create(
+            page=page,
+            chunk_index=1,
+            text='Kütüphane veri tabanları ve danışma hizmetleri hakkında bilgi.',
+        )
+
+        _normal_prompt, normal_chunks = build_prompt('Genel soru nedir?', [chunk_a, chunk_b])
+        _facility_prompt, facility_chunks = build_prompt('Kütüphane hakkında bilgi verir misin?', [chunk_a, chunk_b])
+
+        self.assertEqual(normal_chunks, [chunk_a])
+        self.assertEqual(facility_chunks, [chunk_a, chunk_b])
+
+    def test_query_expansion_applies_only_to_topic_queries(self):
+        self.assertIn('library', _expanded_query_terms('kütüphane hakkında bilgi'))
+        self.assertIn('veritabanı', _expanded_query_terms('kütüphane hakkında bilgi'))
+        self.assertIn('fitness', _expanded_query_terms('spor merkezi nerede?'))
+
+        self.assertEqual(_expanded_query_terms('pc müh ücreti'), set())
+        self.assertEqual(_expanded_query_terms('pc müh hocaları'), set())
+        self.assertEqual(_expanded_query_terms('bilgisayar mühendisliği taban puan'), set())
+        self.assertEqual(_expanded_query_terms('bilgisayar mühendisliği ders planı'), set())
+
+    def test_direct_facility_retrieval_uses_expanded_library_terms(self):
+        page = WebPage.objects.create(
+            url='https://example.com/bilgi-merkezi',
+            source='main_site',
+            title='Bilgi Merkezi',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-expanded-library',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Veritabanı erişimi ve çalışma alanı hizmetleri resmi kaynakta anlatılır.',
+            metadata={
+                'kind': 'main_site_page',
+                'topic': 'library',
+                'topic_label': 'Kütüphane',
+            },
+        )
+
+        results = _retrieve_direct_facility_chunks('kütüphane hakkında bilgi', limit=5)
+
+        self.assertEqual(results, [chunk])
 
     def test_build_prompt_includes_program_and_faculty_metadata(self):
         page = WebPage.objects.create(
@@ -402,6 +469,39 @@ class ChatServiceTests(TestCase):
             hints,
         )
 
+    def test_pc_muh_staff_query_flags_and_direct_chunks(self):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-muhendisligi-akademik-kadro',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-pc-muh-staff',
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'unit_name': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Ahmet Bulut',
+                'staff_title': 'Prof. Dr.',
+                'staff_count': 1,
+                'section_title': 'Akademik Kadro',
+            },
+        )
+
+        question = 'pc müh hocaları kaç tane ve isimleri'
+        chunks = _retrieve_direct_staff_chunks(question, limit=5)
+
+        self.assertTrue(_is_staff_query(question))
+        self.assertTrue(_is_staff_count_query(question))
+        self.assertTrue(_is_staff_list_query(question))
+        self.assertEqual(chunks, [staff_chunk])
+
     def test_dentistry_query_matches_common_turkish_terms(self):
         self.assertTrue(_is_dentistry_query('Acıbadem Üniversitesinde dişçilik var mı?'))
         self.assertTrue(_is_dentistry_query('Diş hekimliği bölümü var mı?'))
@@ -562,6 +662,95 @@ class ChatServiceTests(TestCase):
         results = _retrieve_candidates('Bilgisayar mühendisliği hocaları kimler?', [0.1, 0.2])
 
         self.assertEqual(results, [staff_chunk, head_chunk])
+
+    @override_settings(RAG_RETRIEVE_LIMIT=2, RAG_PER_PAGE_LIMIT=2, RAG_RRF_K=60)
+    @patch('chat.services.retrieve_keyword_context')
+    @patch('chat.services.retrieve_context')
+    def test_retrieve_candidates_uses_rrf_across_vector_and_keyword_results(
+        self,
+        retrieve_context_mock,
+        retrieve_keyword_context_mock,
+    ):
+        page = WebPage.objects.create(
+            url='https://example.com/kampus',
+            source='main_site',
+            title='Kampüs Olanakları',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-rrf-page',
+        )
+        vector_only_chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Vektör aramada ilk gelen genel kampüs bilgisi.',
+        )
+        shared_chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=1,
+            text='Hem vektör hem keyword aramada üst sırada gelen kampüs bilgisi.',
+        )
+        retrieve_context_mock.return_value = [vector_only_chunk, shared_chunk]
+        retrieve_keyword_context_mock.return_value = [shared_chunk]
+
+        results = _retrieve_candidates('kampüs hakkında bilgi', [0.1, 0.2])
+
+        self.assertEqual(results[:2], [shared_chunk, vector_only_chunk])
+
+    @override_settings(RAG_RETRIEVE_LIMIT=2, RAG_PER_PAGE_LIMIT=2)
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    def test_retrieve_candidates_keeps_protected_direct_staff_before_vector_noise(
+        self,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+    ):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-akademik-kadro',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-protected-direct-staff',
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği akademik kadro | isim: Ahmet Bulut | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'unit_name': 'Bilgisayar Mühendisliği',
+                'entity_name': 'Ahmet Bulut',
+                'section_title': 'Akademik Kadro',
+            },
+        )
+        noise_page = WebPage.objects.create(
+            url='https://example.com/psikoloji-akademik-kadro',
+            source='main_site',
+            title='Psikoloji - Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-vector-noise-staff',
+        )
+        noise_chunk = ContentChunk.objects.create(
+            page=noise_page,
+            chunk_index=0,
+            text='Psikoloji akademik kadro | isim: Farklı Hoca | unvan: Prof. Dr.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'program_title': 'Psikoloji',
+                'unit_name': 'Psikoloji',
+                'entity_name': 'Farklı Hoca',
+                'section_title': 'Akademik Kadro',
+            },
+        )
+        retrieve_context_mock.return_value = [noise_chunk]
+
+        results = _retrieve_candidates('pc müh hocaları', [0.1, 0.2])
+
+        self.assertEqual(results[0], staff_chunk)
 
     @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
     @patch('chat.services.retrieve_keyword_context', return_value=[])
@@ -1563,6 +1752,84 @@ class ChatServiceTests(TestCase):
     @patch('chat.services.retrieve_keyword_context', return_value=[])
     @patch('chat.services.retrieve_context')
     @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_resolves_pc_muh_staff_count_and_names_without_llm(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        staff_page = WebPage.objects.create(
+            url='https://example.com/bilgisayar-akademik-kadro',
+            source='main_site',
+            title='Bilgisayar Mühendisliği - Akademik Kadro',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-pc-muh-chat-staff',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'staff_count': 3,
+            },
+        )
+        for index, (name, title) in enumerate(
+            (
+                ('Ahmet Bulut', 'Prof. Dr.'),
+                ('Seda Nilgün Dumlu', 'Öğr. Gör. Dr.'),
+                ('Seher Sonkaya', 'Arş. Gör.'),
+            )
+        ):
+            ContentChunk.objects.create(
+                page=staff_page,
+                chunk_index=index,
+                text=f'Bilgisayar Mühendisliği akademik kadro | isim: {name} | unvan: {title}',
+                metadata={
+                    'kind': 'main_site_staff_page',
+                    'record_type': 'academic_staff_member',
+                    'program_title': 'Bilgisayar Mühendisliği',
+                    'unit_name': 'Bilgisayar Mühendisliği',
+                    'entity_name': name,
+                    'staff_title': title,
+                    'staff_count': 3,
+                    'section_title': 'Akademik Kadro',
+                },
+            )
+        score_page = WebPage.objects.create(
+            url='https://example.com/structured-score',
+            source='structured',
+            title='Bilgisayar Mühendisliği (İngilizce) - Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-pc-muh-chat-score',
+        )
+        score_chunk = ContentChunk.objects.create(
+            page=score_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği kontenjan ve puan bilgisi.',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'record_type': 'quota_row',
+                'program_title': 'Bilgisayar Mühendisliği',
+                'section_title': 'Kontenjan ve Puan',
+            },
+        )
+        retrieve_context_mock.return_value = [score_chunk]
+
+        payload = chat('pc müh hocaları kaç tane ve isimleri')
+
+        self.assertIn('Bilgisayar Mühendisliği akademik kadro kaynağında 3 hoca kaydı var:', payload['answer'])
+        self.assertIn('- Prof. Dr. Ahmet Bulut', payload['answer'])
+        self.assertIn('- Öğr. Gör. Dr. Seda Nilgün Dumlu', payload['answer'])
+        self.assertIn('- Arş. Gör. Seher Sonkaya', payload['answer'])
+        self.assertTrue(payload['sources'])
+        self.assertTrue(all('Akademik Kadro' in source['title'] for source in payload['sources']))
+        self.assertTrue(all('Kontenjan' not in source['title'] for source in payload['sources']))
+        generate_answer_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer')
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
     def test_chat_resolves_followup_staff_count_from_conversation(
         self,
         _embed_query_mock,
@@ -2232,3 +2499,94 @@ class WarmModelsCommandTests(TestCase):
         warm_llm_model_mock.assert_not_called()
         self.assertIn('skipping local warmup', stdout.getvalue())
         self.assertIn('LLM warmup skipped', stdout.getvalue())
+
+    def test_campus_life_topic_matches_sosyal_imkanlar(self):
+        topics = _question_topics('Kampüste hangi sosyal imkanlar var?')
+        self.assertIn('campus_life', topics)
+
+    def test_campus_life_topic_matches_kampus_yasam(self):
+        topics = _question_topics('Kampüs yaşam hakkında bilgi verir misiniz?')
+        self.assertIn('campus_life', topics)
+
+    def test_campus_life_topic_matches_yemekhane(self):
+        topics = _question_topics('Yemekhane var mı?')
+        self.assertIn('campus_life', topics)
+
+    def test_campus_life_topic_matches_ogrenci_hayati(self):
+        topics = _question_topics('Öğrenci hayatı nasıl?')
+        self.assertIn('campus_life', topics)
+
+    def test_campus_life_topic_does_not_match_general_program_query(self):
+        topics = _question_topics('Bilgisayar mühendisliği dersleri neler?')
+        self.assertNotIn('campus_life', topics)
+
+    def test_campus_life_topic_combines_with_library_and_sports(self):
+        topics = _question_topics('Kampüste kütüphane ve spor imkanları var mı?')
+        self.assertIn('campus_life', topics)
+        self.assertIn('library', topics)
+        self.assertIn('sports', topics)
+
+    @override_settings(
+        RAG_RETRIEVE_LIMIT=3,
+        RAG_PER_PAGE_LIMIT=3,
+        RAG_VECTOR_DISTANCE_STRICT=0.72,
+        RAG_QUERY_EXPANSION_ENABLED=True,
+    )
+    def test_direct_facility_retrieval_includes_campus_life_terms(self):
+        campus_page = WebPage.objects.create(
+            url='https://example.com/campus-life',
+            source='main_site',
+            title='Kampüs Yaşam',
+            content_text='Yemekhane ve kafeterya',
+            raw_html='<main>Yemekhane ve kafeterya</main>',
+            content_hash='hash-campus',
+        )
+        campus_chunk = ContentChunk.objects.create(
+            page=campus_page,
+            chunk_index=0,
+            text='Kampüste yemekhane, kafeterya ve sosyal alanlar bulunmaktadır.',
+            metadata={'kind': 'main_site_page', 'source_group': 'department'},
+        )
+        results = _retrieve_direct_facility_chunks('Kampüste hangi sosyal imkanlar var?', limit=5)
+        chunk_ids = [c.id for c in results]
+        self.assertIn(campus_chunk.id, chunk_ids)
+
+    @override_settings(
+        RAG_RETRIEVE_LIMIT=3,
+        RAG_PER_PAGE_LIMIT=3,
+    )
+    def test_filter_candidates_returns_campus_chunks_for_campus_life_query(self):
+        campus_page = WebPage.objects.create(
+            url='https://example.com/campus',
+            source='main_site',
+            title='Kampüs Olanakları',
+            content_text='Yemekhane ve spor',
+            raw_html='<main>Yemekhane ve spor</main>',
+            content_hash='hash-campus2',
+        )
+        irrelevant_page = WebPage.objects.create(
+            url='https://example.com/score',
+            source='structured',
+            title='Kontenjan ve Puan',
+            content_text='Taban puan bilgisi',
+            raw_html='{}',
+            content_hash='hash-score2',
+        )
+        campus_chunk = ContentChunk.objects.create(
+            page=campus_page,
+            chunk_index=0,
+            text='Kampüste yemekhane, kafeterya ve sosyal alanlar bulunmaktadır.',
+            metadata={'kind': 'main_site_page', 'source_group': 'department', 'topic': 'campus_life'},
+        )
+        score_chunk = ContentChunk.objects.create(
+            page=irrelevant_page,
+            chunk_index=0,
+            text='Taban puan: 350',
+            metadata={'kind': 'structured_admissions_score', 'record_type': 'quota_row'},
+        )
+        filtered = _filter_candidates_for_query(
+            'Kampüste hangi sosyal imkanlar var?',
+            [campus_chunk, score_chunk],
+        )
+        self.assertIn(campus_chunk, filtered)
+        self.assertNotIn(score_chunk, filtered)

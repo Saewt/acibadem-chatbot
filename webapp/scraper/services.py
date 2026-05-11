@@ -238,6 +238,33 @@ CANDIDATE_TOPIC_PATTERNS = (
         '/ogrenci/ogrenci-isleri/cift-anadal-yandal-programlari',
     ),
 )
+GENERAL_TOPIC_PATTERNS = (
+    (
+        'library',
+        'Kütüphane',
+        ('kütüphane', 'kutuphane', 'library'),
+    ),
+    (
+        'sports',
+        'Spor Merkezi',
+        ('spor', 'sport', 'fitness', 'havuz', 'yüzme', 'yuzme', 'basketbol'),
+    ),
+    (
+        'dormitory',
+        'Yurt Bilgileri ve Ücretleri',
+        ('yurt', 'konaklama', 'depozito', 'dorm'),
+    ),
+    (
+        'international',
+        'Uluslararası Olanaklar',
+        ('erasmus', 'uluslararası', 'uluslararasi', 'değişim', 'degisim', 'hareketlilik'),
+    ),
+    (
+        'double_major_minor',
+        'Çift Anadal-Yandal Programları',
+        ('çift anadal', 'cift anadal', 'yandal', 'çap', 'cap', 'minor', 'major'),
+    ),
+)
 DEFAULT_CANDIDATE_ROOT_URL = 'https://www.acibadem.edu.tr/aday/ogrenci'
 DEFAULT_CANDIDATE_TOPIC_URLS = tuple(
     f'https://{MAIN_SITE_HOST}{path}' for _topic, _label, path in CANDIDATE_TOPIC_PATTERNS
@@ -410,6 +437,24 @@ def _get_candidate_topic_details(url: str) -> tuple[str, str] | None:
         if lowered_path.startswith(prefix.casefold()):
             return topic, label
     return None
+
+
+def infer_general_topic_metadata(url: str, title: str = '') -> dict:
+    parsed_path = urlparse(url or '').path
+    searchable = _normalize_lookup_text(f'{title} {parsed_path}')
+    if not searchable:
+        return {}
+
+    for topic, topic_label, keywords in GENERAL_TOPIC_PATTERNS:
+        for keyword in keywords:
+            normalized_keyword = _normalize_lookup_text(keyword)
+            if re.search(rf'(^|\s){re.escape(normalized_keyword)}($|\s)', searchable):
+                return {
+                    'topic': topic,
+                    'topic_label': topic_label,
+                    'section_title': topic_label,
+                }
+    return {}
 
 
 def canonicalize_main_site_url(url: str) -> str | None:
@@ -1159,6 +1204,10 @@ def extract_main_site_page(url: str, html: str) -> ExtractedPage | None:
             metadata.update(_candidate_topic_metadata(url))
             if metadata.get('kind') == 'candidate_topic_page':
                 metadata.setdefault('section_title', title or metadata.get('topic_label', ''))
+            else:
+                topic_metadata = infer_general_topic_metadata(url, title)
+                for key, value in topic_metadata.items():
+                    metadata.setdefault(key, value)
 
     if len(text) < MIN_USEFUL_TEXT_LENGTH:
         return None

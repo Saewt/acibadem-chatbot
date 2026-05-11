@@ -106,7 +106,7 @@ LLM_DEFAULT_BASE_URL = (
     else MODEL_RUNNER_BASE_URL
 )
 LLM_BASE_URL = os.environ.get('LLM_BASE_URL', LLM_DEFAULT_BASE_URL).rstrip('/')
-LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen3:4b')
+LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen3:8b')
 LLM_THINK = _env_bool('LLM_THINK', True)
 LLM_WARMUP_ENABLED = _env_bool('LLM_WARMUP_ENABLED', False)
 LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', '512'))
@@ -127,9 +127,13 @@ EMBEDDING_API_TIMEOUT = int(os.environ.get('EMBEDDING_API_TIMEOUT', '30'))
 EMBEDDING_BATCH_SIZE = int(os.environ.get('EMBEDDING_BATCH_SIZE', '2'))
 CACHE_TTL = int(os.environ.get('CACHE_TTL', '3600'))
 RAG_RETRIEVE_LIMIT = int(os.environ.get('RAG_RETRIEVE_LIMIT', '3'))
-RAG_PER_PAGE_LIMIT = int(os.environ.get('RAG_PER_PAGE_LIMIT', '1'))
+RAG_PER_PAGE_LIMIT = int(os.environ.get('RAG_PER_PAGE_LIMIT', '3'))
 RAG_MAX_CHUNK_CHARS = int(os.environ.get('RAG_MAX_CHUNK_CHARS', '500'))
 RAG_MAX_CONTEXT_CHARS = int(os.environ.get('RAG_MAX_CONTEXT_CHARS', '1800'))
+RAG_VECTOR_DISTANCE_STRICT = float(os.environ.get('RAG_VECTOR_DISTANCE_STRICT', '0.72'))
+RAG_VECTOR_DISTANCE_BROAD = float(os.environ.get('RAG_VECTOR_DISTANCE_BROAD', '0.85'))
+RAG_RRF_K = int(os.environ.get('RAG_RRF_K', '60'))
+RAG_QUERY_EXPANSION_ENABLED = _env_bool('RAG_QUERY_EXPANSION_ENABLED', True)
 CHAT_WARMUP_ENABLED = os.environ.get('CHAT_WARMUP_ENABLED', 'True') == 'True'
 ACIBADEM_DATASET_ROOT = os.environ.get(
     'ACIBADEM_DATASET_ROOT',

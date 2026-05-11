@@ -5,14 +5,16 @@ import re
 import threading
 import unicodedata
 from collections.abc import Iterator
+from dataclasses import dataclass
 from time import perf_counter
 
 import requests
 from django.conf import settings
-from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramSimilarity
 from django.core.cache import cache
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q, Value
+from django.db.models.functions import Coalesce
 from openai import OpenAI
 from pgvector.django import CosineDistance
 
@@ -31,7 +33,7 @@ LLM_BUSY_ANSWER = (
     'Lütfen birkaç saniye sonra tekrar deneyin.'
 )
 QUESTION_HASH_LENGTH = 12
-CACHE_KEY_VERSION = 'v12'
+CACHE_KEY_VERSION = 'v15'
 CANDIDATE_LIMIT_MULTIPLIER = 3
 SSE_DONE_SENTINEL = '[DONE]'
 PROGRAM_ABBREVIATION_MIN_LENGTH = 3
@@ -45,6 +47,17 @@ PROGRAM_ABBREVIATION_STOP_WORDS = frozenset({
     'türkçe',
     'turkce',
 })
+
+
+@dataclass
+class RetrievalHit:
+    chunk: ContentChunk
+    method: str
+    rank: int
+    weight: float
+    protected: bool = False
+    distance: float | None = None
+    keyword_rank: float | None = None
 STAFF_QUERY_PATTERN = re.compile(
     r'\b('
     r'hoca\w*|'
@@ -121,6 +134,27 @@ INTERNATIONAL_QUERY_PATTERN = re.compile(
 DOUBLE_MAJOR_MINOR_QUERY_PATTERN = re.compile(
     r'\b(çift\s*anadal\w*|cift\s*anadal\w*|yandal\w*|çap\w*|cap\w*|minor\w*|major\w*)\b'
 )
+LIBRARY_QUERY_PATTERN = re.compile(
+    r'\b(kütüphane\w*|kutuphane\w*|library\w*)\b'
+)
+SPORTS_QUERY_PATTERN = re.compile(
+    r'\b(spor\w*|sport\w*|fitness\w*|gym\w*|yüzme\w*|yuzme\w*|havuz\w*|basketbol\w*|antrenman\w*)\b'
+)
+CAMPUS_LIFE_QUERY_PATTERN = re.compile(
+    r'(?:'
+    r'kampüs\w*|kampus\w*|'
+    r'sosyal\s*(?:imkan|olanak|tesis|etkinlik|yasam|haya|yaşam)\w*|'
+    r'imkan\w*|olanak\w*|'
+    r'yemekhane\w*|kafeterya\w*|kafe\w*|'
+    r'öğrenci\s*(?:hayat|yaşam|haya)\w*|ogrenci\s*(?:hayat|yasam|haya)\w*|'
+    r'öğrenci\s*kulüb\w*|ogrenci\s*kulub\w*|'
+    r'kampüs\w*\s*(?:imkan|olanak|yaşam|yasam|haya|gezi)\w*|'
+    r'sosyal\s*haya\w*|sosyal\s*yaşa\w*|'
+    r'acuda\s*yaşam\w*|acuda\s*yasam\w*|acu\s*da\s*yaşam\w*|acu\s*da\s*yasam\w*|'
+    r'kampus\s*yaşam\w*|kampus\s*yasam\w*'
+    r')',
+    re.IGNORECASE,
+)
 RANK_QUERY_PATTERN = re.compile(
     r'\b(sıralama\w*|siralama\w*|başarı\s*sıras\w*|basari\s*siras\w*)\b'
 )
@@ -172,6 +206,109 @@ TOPIC_KEYWORDS = {
         'cap',
         'minor',
         'major',
+    ),
+    'library': (
+        'kütüphane',
+        'kutuphane',
+        'library',
+        'çalışma alanı',
+        'calisma alani',
+        'veritabanı',
+        'veritabani',
+        'kaynak',
+    ),
+    'sports': (
+        'spor',
+        'spor merkezi',
+        'fitness',
+        'yüzme',
+        'yuzme',
+        'basketbol',
+        'antrenman',
+    ),
+    'campus_life': (
+        'kampüs',
+        'kampus',
+        'sosyal',
+        'imkan',
+        'olanak',
+        'yemekhane',
+        'kafeterya',
+        'öğrenci hayatı',
+        'ogrenci hayati',
+        'kütüphane',
+        'kutuphane',
+        'spor',
+        'spor merkezi',
+        'yurt',
+        'hizmetlerimiz',
+        'acuda',
+    ),
+}
+QUERY_EXPANSIONS = {
+    'library': (
+        'kütüphane',
+        'kutuphane',
+        'library',
+        'çalışma alanı',
+        'calisma alani',
+        'veritabanı',
+        'veritabani',
+        'kaynak',
+    ),
+    'sports': (
+        'spor',
+        'spor merkezi',
+        'fitness',
+        'gym',
+        'havuz',
+        'yüzme',
+        'yuzme',
+        'basketbol',
+        'antrenman',
+    ),
+    'dormitory': (
+        'yurt',
+        'konaklama',
+        'depozito',
+        'başvuru',
+        'basvuru',
+        'dorm',
+    ),
+    'international': (
+        'erasmus',
+        'uluslararası',
+        'uluslararasi',
+        'değişim',
+        'degisim',
+        'hareketlilik',
+    ),
+    'double_major_minor': (
+        'çift anadal',
+        'cift anadal',
+        'yandal',
+        'çap',
+        'cap',
+        'minor',
+        'major',
+    ),
+    'campus_life': (
+        'kampüs',
+        'kampus',
+        'sosyal',
+        'imkan',
+        'olanak',
+        'yemekhane',
+        'kafeterya',
+        'öğrenci hayatı',
+        'ogrenci hayati',
+        'kütüphane',
+        'kutuphane',
+        'spor',
+        'spor merkezi',
+        'yurt',
+        'hizmetlerimiz',
+        'acuda',
     ),
 }
 
@@ -924,7 +1061,40 @@ def _question_topics(question: str) -> set[str]:
         topics.add('international')
     if DOUBLE_MAJOR_MINOR_QUERY_PATTERN.search(normalized_question):
         topics.add('double_major_minor')
+    if LIBRARY_QUERY_PATTERN.search(normalized_question):
+        topics.add('library')
+    if SPORTS_QUERY_PATTERN.search(normalized_question):
+        topics.add('sports')
+    if CAMPUS_LIFE_QUERY_PATTERN.search(normalized_question):
+        topics.add('campus_life')
     return topics
+
+
+def _query_expansion_topics(question: str) -> set[str]:
+    if not settings.RAG_QUERY_EXPANSION_ENABLED:
+        return set()
+    if _is_staff_query(question) or _is_fee_query(question) or _is_score_query(question) or _is_course_query(question):
+        return set()
+    topics = _question_topics(question)
+    if topics:
+        return topics
+    if _is_general_info_query(question):
+        return topics
+    return set()
+
+
+def _expanded_query_terms(question: str) -> set[str]:
+    terms: set[str] = set()
+    for topic in _query_expansion_topics(question):
+        terms.update(QUERY_EXPANSIONS.get(topic, ()))
+    return {term for term in terms if term}
+
+
+def _expanded_keyword_query_text(question: str) -> str:
+    terms = sorted(_expanded_query_terms(question), key=lambda term: _normalize_lookup_text(term))
+    if not terms:
+        return question
+    return ' '.join([question, *terms])
 
 
 def _chunk_matches_question_topic(question_topics: set[str], chunk: ContentChunk) -> bool:
@@ -947,7 +1117,7 @@ def _chunk_matches_question_topic(question_topics: set[str], chunk: ContentChunk
         )
     )
     for question_topic in question_topics:
-        for keyword in TOPIC_KEYWORDS.get(question_topic, ()):
+        for keyword in TOPIC_KEYWORDS.get(question_topic, ()) + QUERY_EXPANSIONS.get(question_topic, ()):
             if _normalize_lookup_text(keyword) in searchable_text:
                 return True
     return False
@@ -1144,7 +1314,13 @@ def _question_specific_prompt_rules(question: str) -> list[str]:
     elif _is_course_query(question):
         rules.append('Ders planı ve AKTS sorularında öncelikle müfredat yılı ve dönem metadata bilgilerini dikkate al.')
     elif _question_topics(question):
-        rules.append('Burs, yurt, Erasmus, uluslararası olanak veya ÇAP-yandal sorularında yalnızca ilgili konu kaynaklarını kullan.')
+        topics = _question_topics(question)
+        if topics & {'library', 'sports', 'campus_life'}:
+            rules.append('Kütüphane, spor merkezi ve kampüs olanakları sorularında yalnızca ilgili tesis kaynaklarını kullan.')
+            if 'campus_life' in topics:
+                rules.append('Kampüs olanakları sorularında yurt, spor, kütüphane, yemekhane ve sosyal tesis bilgilerini bağlamda varsa birleştirerek cevapla.')
+        else:
+            rules.append('Burs, yurt, Erasmus, uluslararası olanak veya ÇAP-yandal sorularında yalnızca ilgili konu kaynaklarını kullan.')
     return rules
 
 
@@ -1674,6 +1850,98 @@ def _build_general_info_answer(question: str, chunks: list[ContentChunk]) -> str
     return f'{title} hakkında resmi kaynakta şu bilgi yer alıyor: {excerpt} [1]'
 
 
+def _extract_facility_excerpts(chunks: list[ContentChunk], keyword_pattern: re.Pattern) -> list[str]:
+    excerpts: list[str] = []
+    seen_chars: set[str] = set()
+    for chunk in chunks:
+        text = ' '.join(_clean_display_text(chunk.text).split())
+        if not text or text[:80] in seen_chars:
+            continue
+        if _looks_like_navigation(text):
+            continue
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 20]
+        relevant = [s for s in sentences if keyword_pattern.search(_normalize_lookup_text(s))]
+        if relevant:
+            seen_chars.add(text[:80])
+            excerpt = ' '.join(relevant[:3])
+            if excerpt:
+                excerpts.append(excerpt)
+    return excerpts[:3]
+
+
+def _looks_like_navigation(text: str) -> bool:
+    tokens = text.split()
+    if len(tokens) < 5:
+        return False
+    capital_words = sum(1 for t in tokens if t and t[0].isupper())
+    if capital_words > len(tokens) * 0.5:
+        return True
+    if len(text) > 200 and text.count('.') == 0 and text.count('?') == 0:
+        return True
+    return False
+
+
+def _build_facility_info_answer(question: str, chunks: list[ContentChunk]) -> str:
+    topics = _question_topics(question)
+    facility_topics = topics & {'library', 'sports', 'campus_life'}
+    if not facility_topics:
+        return ''
+
+    library_chunks = []
+    sports_chunks = []
+    campus_chunks = []
+    for chunk in chunks:
+        searchable = _normalize_lookup_text(chunk.text[:1000])
+        if 'library' in facility_topics and re.search(r'\bk[uü]t[uü]phane', _normalize_lookup_text(chunk.page.title)):
+            library_chunks.append(chunk)
+        elif 'library' in facility_topics and re.search(r'\bkütüphane|\bkutuphane', searchable):
+            library_chunks.append(chunk)
+        if 'sports' in facility_topics and re.search(r'\bspor\b|\bfitness\b|\by[uü]zme\b', searchable):
+            sports_chunks.append(chunk)
+        if 'campus_life' in facility_topics and re.search(
+            r'\b(kampüs|kampus|sosyal|yemekhane|kafeterya|hizmet|i̇mkan|imkan|olanak|yurt|öğrenci|ogrenci|spor|kütüphane|kutuphane)\b',
+            searchable,
+        ):
+            campus_chunks.append(chunk)
+
+    if not library_chunks and not sports_chunks and not campus_chunks:
+        return ''
+
+    lines: list[str] = []
+    if library_chunks:
+        lib_excerpts = _extract_facility_excerpts(
+            library_chunks, re.compile(r'\bkütüphane|\bkutuphane|\blibrary', re.IGNORECASE)
+        )
+        if lib_excerpts:
+            lines.append('Kütüphane:')
+            for excerpt in lib_excerpts:
+                lines.append(f'- {excerpt}')
+    if sports_chunks:
+        sport_excerpts = _extract_facility_excerpts(
+            sports_chunks, re.compile(r'\bspor\b|\bfitness\b|\byüzme|\bbasketbol|\bhavuz', re.IGNORECASE)
+        )
+        if sport_excerpts:
+            lines.append('Spor Merkezi:')
+            for excerpt in sport_excerpts:
+                lines.append(f'- {excerpt}')
+    if campus_chunks:
+        campus_excerpts = _extract_facility_excerpts(
+            campus_chunks,
+            re.compile(
+                r'\b(kampüs|kampus|sosyal|yemekhane|kafeterya|hizmet|imkan|olanak|yurt|öğrenci|spor|kütüphane|kafetarya|kafe)\b',
+                re.IGNORECASE,
+            ),
+        )
+        if campus_excerpts:
+            lines.append('Kampüs Olanakları:')
+            for excerpt in campus_excerpts:
+                lines.append(f'- {excerpt}')
+
+    if not lines:
+        return ''
+    return '\n'.join(lines)
+
+
 def _staff_member_chunks_for_context(chunks: list[ContentChunk]) -> list[ContentChunk]:
     staff_page_ids = {
         chunk.page_id
@@ -1985,25 +2253,182 @@ def _build_program_presence_answer(question: str, chunks: list[ContentChunk]) ->
     return f'Evet, Acıbadem Üniversitesi resmi kaynaklarında {display_title} programı var{suffix}.'
 
 
+def _vector_distance_threshold(question: str) -> float:
+    if _is_general_info_query(question) or _question_topics(question):
+        return settings.RAG_VECTOR_DISTANCE_BROAD
+    return settings.RAG_VECTOR_DISTANCE_STRICT
+
+
 def retrieve_context(
-    query_embedding: list[float], limit: int | None = None, per_page_limit: int | None = None
+    query_embedding: list[float],
+    limit: int | None = None,
+    per_page_limit: int | None = None,
+    question: str = '',
 ) -> list[ContentChunk]:
     limit = limit or settings.RAG_RETRIEVE_LIMIT
     per_page_limit = per_page_limit or settings.RAG_PER_PAGE_LIMIT
+    threshold = _vector_distance_threshold(question)
+    fallback_threshold = max(threshold, settings.RAG_VECTOR_DISTANCE_BROAD)
     queryset = (
         ContentChunk.objects.select_related('page')
         .filter(embedding__isnull=False, page__is_active=True)
         .annotate(distance=CosineDistance('embedding', query_embedding))
         .order_by('distance')
     )
-    selected: list[ContentChunk] = []
-    for chunk in queryset[: limit * 4]:
-        if chunk.distance is None or chunk.distance > 0.72:
-            continue
-        selected.append(chunk)
-        if len(selected) >= limit * 2:
-            break
+    candidates = list(queryset[: limit * 4])
+
+    def _select_with_threshold(max_distance: float) -> list[ContentChunk]:
+        selected: list[ContentChunk] = []
+        for chunk in candidates:
+            if chunk.distance is None or chunk.distance > max_distance:
+                continue
+            selected.append(chunk)
+            if len(selected) >= limit * 2:
+                break
+        return selected
+
+    selected = _select_with_threshold(threshold)
+    if not selected and fallback_threshold > threshold:
+        selected = _select_with_threshold(fallback_threshold)
     return _limit_chunks(selected, limit=limit, per_page_limit=per_page_limit)
+
+
+def _chunks_to_hits(
+    chunks: list[ContentChunk],
+    *,
+    method: str,
+    weight: float,
+    protected: bool = False,
+) -> list[RetrievalHit]:
+    hits: list[RetrievalHit] = []
+    for index, chunk in enumerate(chunks, start=1):
+        hits.append(
+            RetrievalHit(
+                chunk=chunk,
+                method=method,
+                rank=index,
+                weight=weight,
+                protected=protected,
+                distance=getattr(chunk, 'distance', None),
+                keyword_rank=getattr(chunk, 'rank', None),
+            )
+        )
+    return hits
+
+
+def _sort_candidate_hits(question: str, hits: list[RetrievalHit]) -> list[ContentChunk]:
+    grouped: dict[int, dict] = {}
+    for order, hit in enumerate(hits):
+        chunk_key = hit.chunk.pk or id(hit.chunk)
+        if chunk_key not in grouped:
+            grouped[chunk_key] = {
+                'chunk': hit.chunk,
+                'score': 0.0,
+                'protected': False,
+                'first_order': order,
+            }
+        grouped_hit = grouped[chunk_key]
+        grouped_hit['score'] += hit.weight / (settings.RAG_RRF_K + hit.rank)
+        grouped_hit['protected'] = grouped_hit['protected'] or hit.protected
+        grouped_hit['first_order'] = min(grouped_hit['first_order'], order)
+
+    return [
+        item['chunk']
+        for item in sorted(
+            grouped.values(),
+            key=lambda item: (
+                0 if item['protected'] else 1,
+                _chunk_priority(question, item['chunk']),
+                -item['score'],
+                item['first_order'],
+            ),
+        )
+    ]
+
+
+def _retrieve_direct_score_chunks(question: str, limit: int) -> list[ContentChunk]:
+    if not _is_score_query(question):
+        return []
+
+    program_title = (
+        _extract_program_abbreviation_from_text(question)
+        or _extract_known_program_from_text(question)
+        or _extract_program_hint_from_text(question)
+    )
+
+    program_lookup = Q()
+    if program_title:
+        for term in _program_lookup_terms(program_title):
+            program_lookup |= (
+                Q(metadata__program_title__icontains=term)
+                | Q(metadata__placement_label__icontains=term)
+                | Q(metadata__unit_name__icontains=term)
+                | Q(metadata__program_alias_text__icontains=term)
+                | Q(page__title__icontains=term)
+                | Q(text__icontains=term)
+            )
+
+    queryset = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(Q(metadata__kind='structured_admissions_score') | Q(metadata__record_type='quota_row'))
+    )
+    if program_lookup:
+        queryset = queryset.filter(program_lookup)
+    return list(queryset.order_by('page_id', 'chunk_index')[:limit])
+
+
+def _direct_candidate_hits(question: str, candidate_limit: int) -> list[RetrievalHit]:
+    hits: list[RetrievalHit] = []
+    hits.extend(
+        _chunks_to_hits(
+            _retrieve_direct_staff_chunks(question, limit=candidate_limit * 2),
+            method='direct_staff',
+            weight=2.0,
+            protected=_is_staff_query(question),
+        )
+    )
+    hits.extend(
+        _chunks_to_hits(
+            _retrieve_direct_program_chunks(question, limit=candidate_limit),
+            method='direct_program',
+            weight=2.0,
+            protected=_is_program_exists_query(question),
+        )
+    )
+    hits.extend(
+        _chunks_to_hits(
+            _retrieve_direct_score_chunks(question, limit=candidate_limit),
+            method='direct_score',
+            weight=2.0,
+            protected=_is_score_query(question),
+        )
+    )
+    hits.extend(
+        _chunks_to_hits(
+            _retrieve_direct_fee_chunks(question, limit=candidate_limit),
+            method='direct_fee',
+            weight=2.0,
+            protected=_is_fee_query(question),
+        )
+    )
+    hits.extend(
+        _chunks_to_hits(
+            _retrieve_direct_course_chunks(question, limit=candidate_limit * 2),
+            method='direct_course',
+            weight=2.0,
+            protected=_is_course_query(question),
+        )
+    )
+    hits.extend(
+        _chunks_to_hits(
+            _retrieve_direct_facility_chunks(question, limit=candidate_limit * 2),
+            method='direct_facility',
+            weight=3.0,
+            protected=bool(_question_topics(question) & {'library', 'sports', 'campus_life'}),
+        )
+    )
+    return hits
 
 
 def retrieve_keyword_context(
@@ -2016,6 +2441,8 @@ def retrieve_keyword_context(
         return []
 
     query = SearchQuery(normalized_question, search_type='plain', config='simple')
+    for term in _expanded_query_terms(question):
+        query |= SearchQuery(term, search_type='plain', config='simple')
     vector = (
         SearchVector('text', config='simple')
         + SearchVector('page__title', config='simple')
@@ -2031,12 +2458,23 @@ def retrieve_keyword_context(
         + SearchVector('metadata__topic_label', config='simple')
         + SearchVector('metadata__section_title', config='simple')
     )
+    trgm_similarity = (
+        TrigramSimilarity('text', normalized_question)
+        + TrigramSimilarity('page__title', normalized_question)
+    ) * 0.5
+
+    trgm_sim_safe = Coalesce('trgm_sim', Value(0.0))
+    combined_rank_expr = F('fts_rank') * 0.6 + trgm_sim_safe * 0.4
     queryset = (
         ContentChunk.objects.select_related('page')
         .filter(page__is_active=True)
-        .annotate(rank=SearchRank(vector, query))
-        .filter(rank__gt=0)
-        .order_by('-rank', 'page_id', 'chunk_index')
+        .annotate(fts_rank=SearchRank(vector, query))
+        .annotate(trgm_sim=trgm_similarity)
+        .annotate(combined_rank=combined_rank_expr)
+        .filter(
+            Q(fts_rank__gt=0) | Q(trgm_sim__gt=0.15)
+        )
+        .order_by('-combined_rank', 'page_id', 'chunk_index')
     )
 
     return _limit_chunks(list(queryset[: limit * 4]), limit=limit, per_page_limit=per_page_limit)
@@ -2053,9 +2491,16 @@ def _truncate_context_text(text: str, max_chars: int) -> str:
     return normalized[: max_chars - 1].rstrip() + '…'
 
 
-def _select_prompt_chunks(chunks: list[ContentChunk]) -> list[tuple[ContentChunk, str]]:
-    max_chunk_chars = settings.RAG_MAX_CHUNK_CHARS
+def _prompt_context_char_limit(question: str) -> int:
     max_context_chars = settings.RAG_MAX_CONTEXT_CHARS
+    if _is_general_info_query(question) or (_question_topics(question) & {'library', 'sports', 'campus_life'}):
+        return max_context_chars * 2
+    return max_context_chars
+
+
+def _select_prompt_chunks(question: str, chunks: list[ContentChunk]) -> list[tuple[ContentChunk, str]]:
+    max_chunk_chars = settings.RAG_MAX_CHUNK_CHARS
+    max_context_chars = _prompt_context_char_limit(question)
     selected: list[tuple[ContentChunk, str]] = []
     total_chars = 0
 
@@ -2105,7 +2550,7 @@ def _select_prompt_chunks(chunks: list[ContentChunk]) -> list[tuple[ContentChunk
 
 
 def build_prompt(question: str, chunks: list[ContentChunk]) -> tuple[str, list[ContentChunk]]:
-    prompt_chunks = _select_prompt_chunks(chunks)
+    prompt_chunks = _select_prompt_chunks(question, chunks)
     context_blocks = []
     used_chunks = []
     for index, (chunk, excerpt) in enumerate(prompt_chunks, start=1):
@@ -2280,7 +2725,11 @@ def _retrieve_direct_staff_chunks(question: str, limit: int) -> list[ContentChun
     if not _is_staff_query(question):
         return []
 
-    program_title = _extract_known_program_from_text(question) or _extract_program_hint_from_text(question)
+    program_title = (
+        _extract_program_abbreviation_from_text(question)
+        or _extract_known_program_from_text(question)
+        or _extract_program_hint_from_text(question)
+    )
     if not program_title:
         return []
 
@@ -2407,6 +2856,47 @@ def _retrieve_direct_course_chunks(question: str, limit: int) -> list[ContentChu
     )[:limit]
 
 
+def _retrieve_direct_facility_chunks(question: str, limit: int) -> list[ContentChunk]:
+    topics = _question_topics(question)
+    facility_topics = topics & {'library', 'sports', 'campus_life'}
+    if not facility_topics:
+        return []
+
+    text_lookup = Q()
+    title_lookup = Q()
+    if 'library' in facility_topics:
+        for term in QUERY_EXPANSIONS['library']:
+            text_lookup |= Q(text__icontains=term) | Q(page__title__icontains=term)
+            title_lookup |= Q(page__title__icontains=term)
+    if 'sports' in facility_topics:
+        for term in QUERY_EXPANSIONS['sports']:
+            text_lookup |= Q(text__icontains=term) | Q(page__title__icontains=term)
+            title_lookup |= Q(page__title__icontains=term)
+    if 'campus_life' in facility_topics:
+        for term in QUERY_EXPANSIONS['campus_life']:
+            text_lookup |= Q(text__icontains=term) | Q(page__title__icontains=term)
+            title_lookup |= Q(page__title__icontains=term)
+
+    title_hits = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(title_lookup)
+        .order_by('page_id', 'chunk_index')
+    )
+    other_hits = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(text_lookup)
+        .exclude(title_lookup)
+        .order_by('page_id', 'chunk_index')
+    )
+    results = list(title_hits[:limit])
+    remaining = limit - len(results)
+    if remaining > 0:
+        results.extend(list(other_hits[:remaining]))
+    return results
+
+
 def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[ContentChunk]:
     candidate_limit = max(settings.RAG_RETRIEVE_LIMIT * CANDIDATE_LIMIT_MULTIPLIER, settings.RAG_RETRIEVE_LIMIT)
     candidate_per_page_limit = max(
@@ -2417,23 +2907,29 @@ def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[Co
         query_embedding,
         limit=candidate_limit,
         per_page_limit=candidate_per_page_limit,
+        question=question,
     )
     keyword_chunks = retrieve_keyword_context(
         question,
         limit=candidate_limit,
         per_page_limit=candidate_per_page_limit,
     )
-    direct_chunks = _retrieve_direct_staff_chunks(
-        question, limit=candidate_limit * 2
-    ) + _retrieve_direct_program_chunks(
-        question, limit=candidate_limit
-    ) + _retrieve_direct_fee_chunks(
-        question, limit=candidate_limit
-    ) + _retrieve_direct_course_chunks(question, limit=candidate_limit * 2)
-    combined = _sort_candidate_chunks(question, direct_chunks + vector_chunks + keyword_chunks)
+    hits = (
+        _chunks_to_hits(vector_chunks, method='vector', weight=1.0)
+        + _chunks_to_hits(keyword_chunks, method='keyword', weight=1.0)
+        + _direct_candidate_hits(question, candidate_limit)
+    )
+    combined = _sort_candidate_hits(question, hits)
     combined = _filter_candidates_for_query(question, combined)
     if _is_course_query(question):
         combined = sorted(combined, key=lambda chunk: _course_sort_key(question, chunk))
+    facility_topics = _question_topics(question) & {'library', 'sports', 'campus_life'}
+    if facility_topics:
+        return _limit_chunks(
+            combined,
+            limit=settings.RAG_RETRIEVE_LIMIT * 3,
+            per_page_limit=settings.RAG_PER_PAGE_LIMIT * 3,
+        )
     scoped_chunks, had_scope = _apply_scope_filter(question, combined)
     if had_scope and not scoped_chunks:
         scoped_chunks = combined
@@ -2563,6 +3059,8 @@ def _structured_sources(question: str, answer: str, chunks: list[ContentChunk]) 
                 if overview_chunks:
                     return build_sources(overview_chunks[:1])
             return build_sources(course_chunks)
+    if answer and _question_topics(question) & {'library', 'sports', 'campus_life'}:
+        return build_sources(chunks)
     return None
 
 
@@ -2619,6 +3117,8 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
             structured_answer = _build_structured_course_answer(resolved_question, retrieved_chunks)
         if not structured_answer:
             structured_answer = _build_general_info_answer(resolved_question, retrieved_chunks)
+        if not structured_answer:
+            structured_answer = _build_facility_info_answer(resolved_question, retrieved_chunks)
         if structured_answer:
             answer = structured_answer
             structured_sources = _structured_sources(resolved_question, answer, retrieved_chunks)
@@ -2730,6 +3230,8 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
                 structured_answer = _build_structured_course_answer(resolved_question, retrieved_chunks)
             if not structured_answer:
                 structured_answer = _build_general_info_answer(resolved_question, retrieved_chunks)
+            if not structured_answer:
+                structured_answer = _build_facility_info_answer(resolved_question, retrieved_chunks)
             if structured_answer:
                 answer = structured_answer
                 structured_sources = _structured_sources(resolved_question, answer, retrieved_chunks)
