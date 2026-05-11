@@ -35,7 +35,7 @@ Repo, ilk deneme için temizlenmiş bir bilgi tabanı snapshot'ı içerir. Varsa
 Ollama hostta çalışmalıdır; Docker içindeki web servisi host Ollama'ya `http://host.docker.internal:11434` üzerinden bağlanır.
 
 ```powershell
-ollama pull qwen3:4b
+ollama pull qwen3:8b
 ollama serve
 ```
 
@@ -45,7 +45,7 @@ ollama serve
 curl http://localhost:11434/api/tags
 ```
 
-Listede `qwen3:4b` görünmelidir. Bu 4B model kullanılacağı için varsayılan `.env` tek eşzamanlı LLM isteği, kontrollü cevap limiti ve küçük RAG context ile gelir.
+Listede `qwen3:8b` görünmelidir. Bu 8B model kullanılacağı için varsayılan `.env` tek eşzamanlı LLM isteği, kontrollü cevap limiti ve küçük RAG context ile gelir.
 
 ### 4. Host embedding API'yi başlat
 
@@ -211,7 +211,7 @@ ollama list
 Gerekirse modeli tekrar indir ve Ollama servisinin ayakta olduğunu kontrol et:
 
 ```powershell
-ollama pull qwen3:4b
+ollama pull qwen3:8b
 curl http://localhost:11434/api/tags
 ```
 
