@@ -12,7 +12,7 @@ from django.test import SimpleTestCase, TestCase
 from django.test.utils import override_settings
 
 from .embeddings import DEFAULT_EMBEDDING_BATCH_SIZE, _embed_via_api, iter_text_embedding_batches
-from .dataset_import import _build_general_pages
+from .dataset_import import _build_general_pages, _derive_general_page_metadata
 from .models import ContentChunk, KnowledgeSyncState, WebPage
 from .services import (
     DEFAULT_MAIN_SITE_SEEDS,
@@ -30,6 +30,7 @@ from .services import (
     ExtractedPage,
     extract_main_site_page,
     fetch_html,
+    infer_general_topic_metadata,
     upsert_page_content,
     upsert_page_chunks,
 )
@@ -367,6 +368,70 @@ class ScraperServiceTests(TestCase):
         self.assertEqual(extracted.metadata['topic'], 'scholarships')
         self.assertEqual(extracted.metadata['topic_label'], 'Burs Olanakları')
         self.assertEqual(extracted.metadata['section_title'], 'Burs Olanakları')
+
+    def test_infers_general_topic_metadata_from_url_and_title(self):
+        self.assertEqual(
+            infer_general_topic_metadata(
+                'https://www.acibadem.edu.tr/universite/kutuphane',
+                'Bilgi Merkezi',
+            ),
+            {
+                'topic': 'library',
+                'topic_label': 'Kütüphane',
+                'section_title': 'Kütüphane',
+            },
+        )
+        self.assertEqual(
+            infer_general_topic_metadata(
+                'https://www.acibadem.edu.tr/ogrenci/acuda-yasam/spor-merkezi',
+                'ACU Spor Merkezi',
+            )['topic'],
+            'sports',
+        )
+
+    def test_extract_main_site_page_infers_general_topic_metadata(self):
+        html = """
+        <html>
+          <body>
+            <h1 class="page-title">Kütüphane</h1>
+            <main>
+              <div id="block-acu-content">
+                <p>Kütüphane koleksiyonu, veritabanı erişimi ve çalışma alanları hakkında resmi bilgiler burada yer almaktadır.</p>
+              </div>
+            </main>
+          </body>
+        </html>
+        """
+
+        extracted = extract_main_site_page(
+            'https://www.acibadem.edu.tr/universite/kutuphane',
+            html,
+        )
+
+        self.assertIsNotNone(extracted)
+        self.assertEqual(extracted.metadata['kind'], 'main_site_page')
+        self.assertEqual(extracted.metadata['topic'], 'library')
+        self.assertEqual(extracted.metadata['topic_label'], 'Kütüphane')
+        self.assertEqual(extracted.metadata['section_title'], 'Kütüphane')
+
+    def test_dataset_import_infers_general_topic_metadata(self):
+        metadata = _derive_general_page_metadata(
+            {
+                'source_id': 'source-library',
+                'source_group': 'general',
+                'source_variant': 'default',
+                'candidate_page_kind': None,
+                'title': 'Kütüphane',
+                'canonical_url': 'https://www.acibadem.edu.tr/universite/kutuphane',
+                'host': 'www.acibadem.edu.tr',
+            },
+            [],
+        )
+
+        self.assertEqual(metadata['kind'], 'main_site_page')
+        self.assertEqual(metadata['topic'], 'library')
+        self.assertEqual(metadata['topic_label'], 'Kütüphane')
+        self.assertEqual(metadata['section_title'], 'Kütüphane')
 
     def test_extract_bologna_page_filters_short_text(self):
         html = """
@@ -1235,6 +1300,7 @@ class FetchHtmlTests(SimpleTestCase):
 
 
 class EmbeddingHelperTests(SimpleTestCase):
+    @override_settings(EMBEDDING_BACKEND='local')
     @patch('scraper.embeddings.get_embedding_model')
     def test_iter_text_embedding_batches_splits_inputs_and_preserves_order(
         self, get_embedding_model_mock
@@ -1730,11 +1796,10 @@ class ImportDatasetCommandTests(SimpleTestCase):
             dataset_root='/tmp/dataset',
             force_refresh=False,
         )
-        call_command_mock.assert_called_once_with(
-            'generate_embeddings',
-            rebuild=False,
-            stdout=stdout,
-        )
+        call_command_mock.assert_called_once()
+        self.assertEqual(call_command_mock.call_args.args, ('generate_embeddings',))
+        self.assertEqual(call_command_mock.call_args.kwargs['rebuild'], False)
+        self.assertTrue(hasattr(call_command_mock.call_args.kwargs['stdout'], 'write'))
         self.assertIn('import_acibadem_dataset completed', stdout.getvalue())
 
 

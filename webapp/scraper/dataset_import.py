@@ -8,6 +8,7 @@ from scraper.services import (
     _build_structured_page_url,
     _split_program_title_and_placement,
     hash_content,
+    infer_general_topic_metadata,
     normalize_whitespace,
     upsert_page_chunks,
     mark_missing_pages_inactive,
@@ -148,6 +149,12 @@ def _derive_general_page_metadata(
             metadata['topic'], metadata['topic_label'] = topic_kind
         else:
             metadata['kind'] = 'main_site_page'
+            topic_metadata = infer_general_topic_metadata(
+                _normalize_source_url(source),
+                source.get('title') or '',
+            )
+            for key, value in topic_metadata.items():
+                metadata.setdefault(key, value)
     return metadata
 
 

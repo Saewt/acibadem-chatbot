@@ -1,6 +1,7 @@
 import logging
 import os
 from pathlib import Path
+from typing import Optional
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -42,7 +43,7 @@ MODEL_DIR = os.environ.get(
     os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
 )
 
-_model: SentenceTransformer | None = None
+_model: Optional[SentenceTransformer] = None
 _ready: bool = False
 
 
