@@ -23,6 +23,7 @@ from scraper.models import ContentChunk
 
 from .models import Conversation, Message
 
+_thread_local = threading.local()
 logger = logging.getLogger(__name__)
 NO_CONTEXT_ANSWER = (
     'Bu konuda doğrulanmış üniversite kaynağı bulamadım. '
@@ -32,8 +33,12 @@ LLM_BUSY_ANSWER = (
     'Model şu anda başka bir yanıt üretiyor. '
     'Lütfen birkaç saniye sonra tekrar deneyin.'
 )
+LLM_FORMAT_ERROR_ANSWER = (
+    'Bu soruya yanıt oluşturulurken model çıktısı beklenen biçimde gelmedi. '
+    'Lütfen tekrar dener misin?'
+)
 QUESTION_HASH_LENGTH = 12
-CACHE_KEY_VERSION = 'v15'
+CACHE_KEY_VERSION = 'v30'
 CANDIDATE_LIMIT_MULTIPLIER = 3
 SSE_DONE_SENTINEL = '[DONE]'
 PROGRAM_ABBREVIATION_MIN_LENGTH = 3
@@ -95,6 +100,13 @@ DIRECTOR_QUERY_PATTERN = re.compile(r'\bmudur\w*\b')
 PROGRAM_EXISTS_QUERY_PATTERN = re.compile(
     r'\b(var\s*m[ıi]|bulunuyor\s*mu|mevcut\s*mu|aç[ıi]k\s*m[ıi])\b'
 )
+PROGRAM_LIST_QUERY_PATTERN = re.compile(
+    r'\b(?:hangi|hangileri|neler|nelerdir|listele\w*|göster\w*|goster\w*)\b'
+    r'.*\b(?:bölüm\w*|bolum\w*|program\w*)\b|'
+    r'\b(?:bölüm\w*|bolum\w*|program\w*)\b'
+    r'.*\b(?:hangi|hangileri|neler|nelerdir|listele\w*|göster\w*|goster\w*)\b',
+    re.IGNORECASE,
+)
 DENTISTRY_QUERY_PATTERN = re.compile(
     r'\b(dişçilik|discilik|diş\s*hekimliği|dis\s*hekimligi)\b'
 )
@@ -107,7 +119,13 @@ SCORE_QUERY_PATTERN = re.compile(
     r'başarı\s*sıras\w*|'
     r'basari\s*siras\w*|'
     r'taban\s*puan\w*|'
-    r'tavan\s*puan\w*'
+    r'tavan\s*puan\w*|'
+    r'kaç\s*(?:kişi|kisi|öğrenci|ogrenci|tane|adet)|'
+    r'kac\s*(?:kisi|ogrenci|tane|adet)|'
+    r'kaç\s*kontenjan\w*|'
+    r'kac\s*kontenjan\w*|'
+    r'al(?:ı|i)yor\b|'
+    r'al(?:ı|i)m\s*(?:say[ıi]s[ıi]|miktar[ıi])'
     r')\b'
 )
 FEE_QUERY_PATTERN = re.compile(
@@ -147,13 +165,38 @@ CAMPUS_LIFE_QUERY_PATTERN = re.compile(
     r'imkan\w*|olanak\w*|'
     r'yemekhane\w*|kafeterya\w*|kafe\w*|'
     r'öğrenci\s*(?:hayat|yaşam|haya)\w*|ogrenci\s*(?:hayat|yasam|haya)\w*|'
-    r'öğrenci\s*kulüb\w*|ogrenci\s*kulub\w*|'
     r'kampüs\w*\s*(?:imkan|olanak|yaşam|yasam|haya|gezi)\w*|'
     r'sosyal\s*haya\w*|sosyal\s*yaşa\w*|'
     r'acuda\s*yaşam\w*|acuda\s*yasam\w*|acu\s*da\s*yaşam\w*|acu\s*da\s*yasam\w*|'
     r'kampus\s*yaşam\w*|kampus\s*yasam\w*'
     r')',
     re.IGNORECASE,
+)
+STUDENT_CLUB_QUERY_PATTERN = re.compile(
+    r'\b('
+    r'kulüp\w*|'
+    r'kulup\w*|'
+    r'kulub\w*|'
+    r'topluluk\w*|'
+    r'öğrenci\s*kulüb\w*|'
+    r'ogrenci\s*kulub\w*|'
+    r'öğrenci\s*topluluk\w*|'
+    r'ogrenci\s*topluluk\w*|'
+    r'student\s*club\w*'
+    r')\b',
+    re.IGNORECASE,
+)
+
+TRANSPORT_QUERY_PATTERN = re.compile(
+    r'\b(ulaşım\w*|ulasim\w*|otobüs\w*|otobus\w*|metro\w*|ring\w*|servis\w*|otopark\w*|trafik\w*|dolmuş\w*|dolmus\w*)\b'
+)
+
+PREP_QUERY_PATTERN = re.compile(
+    r'\b(hazırlık\w*|hazirlik\w*|muaf\w*|muafiyet\w*|ingilizce.*hazırlık|hazırlık.*ingilizce|i̇ngilizce.*hazırlık|hazırlık.*i̇ngilizce)\b'
+)
+
+COMPARISON_QUERY_PATTERN = re.compile(
+    r'\b(vs\b|veya\b|yoksa\b|arasındaki\s+fark|farkı\s+nedir|karşılaştır\w*|karsilastir\w*|hangisi\s+daha)\b'
 )
 RANK_QUERY_PATTERN = re.compile(
     r'\b(sıralama\w*|siralama\w*|başarı\s*sıras\w*|basari\s*siras\w*)\b'
@@ -230,12 +273,8 @@ TOPIC_KEYWORDS = {
         'kampüs',
         'kampus',
         'sosyal',
-        'imkan',
-        'olanak',
         'yemekhane',
         'kafeterya',
-        'öğrenci hayatı',
-        'ogrenci hayati',
         'kütüphane',
         'kutuphane',
         'spor',
@@ -244,8 +283,58 @@ TOPIC_KEYWORDS = {
         'hizmetlerimiz',
         'acuda',
     ),
+    'student_clubs': (
+        'öğrenci kulüpleri',
+        'ogrenci kulupleri',
+        'kulüp',
+        'kulup',
+        'kulub',
+        'topluluk',
+        'topluluğu',
+        'toplulugu',
+    ),
+    'transport': (
+        'ulaşım',
+        'ulasim',
+        'otobüs',
+        'otobus',
+        'metro',
+        'ring',
+        'servis',
+        'otopark',
+    ),
+    'prep': (
+        'hazırlık',
+        'hazirlik',
+        'muafiyet',
+        'muaf',
+        'ingilizce',
+        'i̇ngilizce',
+        'yeterlilik',
+        'hazırlık sınıfı',
+        'hazirlik sinifi',
+    ),
+    'comparison': (
+        'fark',
+        'karşılaştırma',
+        'karsilastirma',
+        'avantaj',
+        'dezavantaj',
+    ),
 }
 QUERY_EXPANSIONS = {
+    'scholarships': (
+        'burs',
+        'başarı bursu',
+        'basari bursu',
+        'indirim',
+        'öğrenim ücreti',
+        'ogrenim ucreti',
+        'karşılıksız',
+        'karsiliksiz',
+        'burs başvuru',
+        'burs basvuru',
+    ),
     'library': (
         'kütüphane',
         'kutuphane',
@@ -293,25 +382,117 @@ QUERY_EXPANSIONS = {
         'major',
     ),
     'campus_life': (
+        'kampüs yaşam',
+        'kampus yasam',
+        'kampüs olanakları',
+        'kampus olanaklari',
+        'acuda yaşam',
+        'acuda yasam',
+        'sosyal alan',
         'kampüs',
         'kampus',
         'sosyal',
-        'imkan',
-        'olanak',
         'yemekhane',
         'kafeterya',
-        'öğrenci hayatı',
-        'ogrenci hayati',
         'kütüphane',
         'kutuphane',
         'spor',
         'spor merkezi',
         'yurt',
-        'hizmetlerimiz',
-        'acuda',
+    ),
+    'student_clubs': (
+        'öğrenci kulüpleri',
+        'ogrenci kulupleri',
+        'öğrenci toplulukları',
+        'ogrenci topluluklari',
+        'kulübü',
+        'kulubu',
+        'kulüp',
+        'kulup',
+        'topluluğu',
+        'toplulugu',
+        'topluluk',
+        'acuda yaşam',
+        'acuda yasam',
+    ),
+    'transport': (
+        'ulaşım',
+        'ulasim',
+        'otobüs',
+        'otobus',
+        'metro',
+        'ring',
+        'servis',
+        'otopark',
+        'kampüs ulaşım',
+        'kampus ulasim',
+    ),
+    'prep': (
+        'hazırlık',
+        'hazirlik',
+        'muafiyet',
+        'muaf',
+        'ingilizce',
+        'i̇ngilizce',
+        'yeterlilik',
+        'hazırlık sınıfı',
+        'hazirlik sinifi',
+    ),
+    'comparison': (
+        'fark',
+        'karşılaştırma',
+        'karsilastirma',
+        'avantaj',
+        'dezavantaj',
     ),
 }
 
+
+TOPIC_DESCRIPTIONS: dict[str, list[str]] = {
+    'campus_life': [
+        'kampüs yaşamı sosyal imkanlar',
+        'üniversitede sosyal hayat etkinlikler',
+        'kampüs olanakları tesisler',
+        'yemekhane kafeterya sosyal alanlar',
+        'öğrenci aktiviteleri sosyal alanlar',
+        'okulda hangi imkanlar var',
+        'üniversite sosyal yaşam',
+    ],
+    'student_clubs': [
+        'öğrenci kulüpleri topluluklar',
+        'üniversitedeki kulüpler ve topluluklar',
+        'kulüp listesi öğrenci toplulukları',
+        'acuda yaşam öğrenci kulüpleri',
+    ],
+    'library': [
+        'kütüphane kaynak çalışma alanı',
+        'kütüphane saatleri veritabanı erişim',
+    ],
+    'sports': [
+        'spor merkezi fitness salon',
+        'spor imkanları yüzme basketbol',
+    ],
+    'dormitory': [
+        'öğrenci yurdu konaklama',
+        'yurt başvuru ücret kampüs içi barınma',
+    ],
+    'international': [
+        'uluslararası öğrenci Erasmus değişim programları',
+        'yurtdışı hareketlilik bilateral agreements',
+    ],
+    'scholarships': [
+        'burs başarı bursu öğrenim desteği',
+        'burs başvuru karşılıksız indirim',
+    ],
+    'transport': [
+        'kampüs ulaşım servis shuttle ring',
+        'otobüs metro ulaşım imkanları',
+    ],
+    'prep': [
+        'İngilizce hazırlık sınıfı muafiyet sınavı',
+        'hazırlık programı dil eğitimi yeterlilik',
+    ],
+}
 
 GREETING_WORDS = frozenset({
     'merhaba', 'selam', 'hello', 'selamlar', 'hey', 'hi', 'slm', 'merhabalar'
@@ -322,6 +503,50 @@ STATE_WORDS = frozenset({
 TEST_WORDS = frozenset({
     'test', 'deneme'
 })
+_THINK_TAG_PATTERN = re.compile(r'<think\b[^>]*>.*?</think>', re.IGNORECASE | re.DOTALL)
+_FINAL_ANSWER_MARKER_PATTERN = re.compile(
+    r'(?:^|\n)\s*(?:possible answer|final answer|cevap|nihai cevap)\s*:\s*',
+    re.IGNORECASE,
+)
+_ANALYSIS_OPENING_PATTERN = re.compile(
+    r"^\s*(?:okay|ok|let's|first,|the user|i need|i should|we need|"
+    r"source\s+\d+\s*:|wait,|looking at|from the sources)",
+    re.IGNORECASE,
+)
+_ANALYSIS_LINE_PATTERN = re.compile(
+    r"^\s*(?:source\s+\d+\s*:|the user|i need|i should|wait,|possible answer\s*:)",
+    re.IGNORECASE,
+)
+_TOPIC_MATCH_TERMS = {
+    'campus_life': (
+        'kampüs',
+        'kampus',
+        'kampüs yaşam',
+        'kampus yasam',
+        'kampüs olanakları',
+        'kampus olanaklari',
+        'acuda yaşam',
+        'acuda yasam',
+        'yemekhane',
+        'kafeterya',
+        'sosyal alan',
+    ),
+    'student_clubs': (
+        'öğrenci kulüpleri',
+        'ogrenci kulupleri',
+        'kulübü',
+        'kulubu',
+        'kulüp',
+        'kulup',
+        'topluluğu',
+        'toplulugu',
+        'topluluk',
+    ),
+}
+_TOPIC_EXCLUDED_SOURCE_GROUPS = {
+    'campus_life': frozenset({'scholarship', 'quota', 'tuition'}),
+    'student_clubs': frozenset({'scholarship', 'quota', 'tuition'}),
+}
 
 
 def _get_greeting_response(question: str) -> str | None:
@@ -424,7 +649,7 @@ def _ollama_chat(messages: list[dict[str, str]], *, temperature: float, max_toke
     )
     response.raise_for_status()
     payload = response.json()
-    return str(payload.get('message', {}).get('content') or '').strip()
+    return _clean_llm_answer(str(payload.get('message', {}).get('content') or ''))
 
 
 def _ollama_chat_stream(
@@ -456,6 +681,79 @@ def _ollama_chat_stream(
                 yield str(content)
             if payload.get('done'):
                 break
+
+
+def _llm_system_prompt() -> str:
+    return (
+        '/no_think\n'
+        'Sen Acıbadem Üniversitesi asistanısın. '
+        'Kullanıcıya doğrudan, kısa ve net Türkçe cevap ver. '
+        'Sadece kullanıcıya gösterilecek nihai cevabı yaz. '
+        'Yanıtını CEVAP: etiketiyle başlat. '
+        'Kaynakları nasıl incelediğini, adım adım analizini veya taslağını yazma. '
+        'Asla <think> veya </think> yazma. '
+        'İç muhakeme, analiz, taslak veya İngilizce düşünme metni gösterme.'
+    )
+
+
+def _looks_like_analysis_text(text: str) -> bool:
+    if not text:
+        return False
+    if _ANALYSIS_OPENING_PATTERN.search(text):
+        return True
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    analysis_lines = sum(1 for line in lines[:8] if _ANALYSIS_LINE_PATTERN.search(line))
+    return analysis_lines >= 2
+
+
+def _extract_final_answer_from_analysis(text: str) -> str:
+    matches = list(_FINAL_ANSWER_MARKER_PATTERN.finditer(text))
+    if not matches:
+        return text
+    return text[matches[-1].end():].strip()
+
+
+def _has_final_answer_marker(text: str) -> bool:
+    return bool(_FINAL_ANSWER_MARKER_PATTERN.search(text))
+
+
+def _clean_llm_answer(answer: str) -> str:
+    text = (answer or '').strip()
+    if not text:
+        return ''
+    text = _THINK_TAG_PATTERN.sub('', text)
+    if '</think>' in text:
+        text = text.rsplit('</think>', 1)[-1]
+    text = re.sub(r'</?think\b[^>]*>', '', text, flags=re.IGNORECASE)
+    text = text.strip()
+    if not text:
+        return ''
+
+    if _has_final_answer_marker(text):
+        text = _extract_final_answer_from_analysis(text)
+    elif _looks_like_analysis_text(text):
+        text = _extract_final_answer_from_analysis(text)
+    if _looks_like_analysis_text(text):
+        return LLM_FORMAT_ERROR_ANSWER
+    return text.strip()
+
+
+def _is_llm_format_error_answer(answer: str) -> bool:
+    return (answer or '').strip() == LLM_FORMAT_ERROR_ANSWER
+
+
+def _llm_retry_prompt(prompt: str) -> str:
+    return (
+        '/no_think\n'
+        'Önceki çıktı geçersizdi çünkü analiz veya taslak içeriyordu.\n'
+        'Aşağıdaki görevi yeniden uygula.\n'
+        'Yalnızca "CEVAP:" ile başlayan nihai Türkçe cevabı yaz.\n'
+        'CEVAP etiketi öncesine hiçbir metin yazma; kaynak analizi, İngilizce açıklama '
+        'veya düşünme süreci yazma.\n\n'
+        f'{prompt}'
+    )
 
 
 def warm_embedding_model() -> None:
@@ -634,11 +932,25 @@ def _extract_known_program_from_text(text: str) -> str:
     normalized_text = _normalize_lookup_text(text)
     if not normalized_text:
         return ''
+    matches: list[str] = []
     for candidate in _known_program_candidates():
-        for alias in _build_scope_aliases(candidate):
-            if _question_mentions_alias(normalized_text, alias):
-                return _clean_display_text(candidate)
-    return ''
+        aliases = _build_scope_aliases(candidate)
+        if any(_question_mentions_alias(normalized_text, alias) for alias in aliases):
+            matches.append(_clean_display_text(candidate))
+    if not matches:
+        return ''
+
+    wants_english = _mentions_english(text)
+    if wants_english:
+        english_matches = [candidate for candidate in matches if _mentions_english(candidate)]
+        if english_matches:
+            matches = english_matches
+    else:
+        non_english_matches = [candidate for candidate in matches if not _mentions_english(candidate)]
+        if non_english_matches:
+            matches = non_english_matches
+
+    return min(matches, key=lambda value: (len(_normalize_lookup_text(value)), value))
 
 
 def _extract_program_hint_from_text(text: str) -> str:
@@ -646,6 +958,37 @@ def _extract_program_hint_from_text(text: str) -> str:
         if field == 'program_title' and aliases:
             return max(aliases, key=len)
     return ''
+
+
+_PROGRAM_EXTRACT_STOP_WORDS = frozenset({
+    'var', 'mi', 'mı', 'mu', 'mü', 'ne', 'kaç', 'kac', 'kim', 'nasil',
+    'nasıl', 'nedir', 'nerede', 'hangi', 'neler', 'acaba', 'kadar',
+    'programı', 'programi', 'bölümü', 'bolumu', 'fakültesi', 'fakultesi',
+    'üniversitesi', 'universitesi', 'hakkında', 'hakkinda', 'bilgi',
+    'hangisi', 'diyorum', 'sence',
+})
+
+
+def _extract_program_from_tokens(text: str) -> str:
+    normalized_text = _normalize_lookup_text(text)
+    if not normalized_text:
+        return ''
+    tokens = [t for t in normalized_text.split()
+              if len(t) > 2 and t not in _PROGRAM_EXTRACT_STOP_WORDS]
+    if not tokens:
+        return ''
+    candidates = _known_program_candidates()
+    matches: list[tuple[str, int]] = []
+    for candidate in candidates:
+        match_count = sum(
+            1 for token in tokens if _normalized_contains(candidate, token)
+        )
+        if match_count == len(tokens):
+            matches.append((_clean_display_text(candidate), match_count, len(candidate)))
+    if not matches:
+        return ''
+    matches.sort(key=lambda x: (-x[1], x[2]))
+    return matches[0][0]
 
 
 def _program_initialism(value: str) -> str:
@@ -722,6 +1065,19 @@ def _question_has_explicit_scope(question: str) -> bool:
     if _extract_program_abbreviation_from_text(question):
         return True
     return bool(_extract_known_program_from_text(question))
+
+
+_FOLLOWUP_STOP_WORDS = frozenset({
+    'var', 'mi', 'mı', 'mu', 'mü', 'ne', 'kaç', 'kac', 'kim', 'nasil',
+    'nasıl', 'nedir', 'nerede', 'hangi', 'kadar', 'bu', 'şu', 'o',
+    'neler', 'nelerdir', 'hangileri', 'hangileridir',
+})
+
+
+def _looks_like_self_contained_question(question: str) -> bool:
+    normalized = _normalize_lookup_text(question)
+    content_tokens = [t for t in normalized.split() if t not in _FOLLOWUP_STOP_WORDS]
+    return len(content_tokens) >= 2
 
 
 def _is_followup_question(question: str) -> bool:
@@ -932,6 +1288,50 @@ def _is_program_exists_query(question: str) -> bool:
     return bool(PROGRAM_EXISTS_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
 
+def _is_program_list_query(question: str) -> bool:
+    normalized_question = _normalize_lookup_text(question)
+    if not PROGRAM_LIST_QUERY_PATTERN.search(normalized_question):
+        return False
+    return not (
+        _is_staff_query(question)
+        or _is_score_query(question)
+        or _is_fee_query(question)
+        or _is_course_query(question)
+    )
+
+
+def _is_engineering_program_list_query(question: str) -> bool:
+    normalized_question = _normalize_lookup_text(question)
+    return _is_program_list_query(question) and bool(
+        re.search(r'\bm[üu]hendislik\b|\bmuhendislik\b', normalized_question)
+    )
+
+
+def _is_engineering_and_natural_sciences_faculty_query(question: str) -> bool:
+    normalized_question = _normalize_lookup_text(question)
+    return bool(
+        re.search(
+            r'm[üu]hendislik\s+ve\s+do[ğg]a\s+bilimleri|'
+            r'muhendislik\s+ve\s+doga\s+bilimleri',
+            normalized_question,
+        )
+    )
+
+
+def _is_engineering_and_natural_sciences_chunk(chunk: ContentChunk) -> bool:
+    faculty = _normalize_lookup_text(_get_chunk_metadata_value(chunk, 'faculty'))
+    title = _normalize_lookup_text(chunk.page.title)
+    text = _normalize_lookup_text(chunk.text[:500])
+    return (
+        'muhendislik ve doga bilimleri' in faculty
+        or 'mühendislik ve doğa bilimleri' in faculty
+        or 'muhendislik ve doga bilimleri' in title
+        or 'mühendislik ve doğa bilimleri' in title
+        or 'muhendislik ve doga bilimleri' in text
+        or 'mühendislik ve doğa bilimleri' in text
+    )
+
+
 def _is_general_info_query(question: str) -> bool:
     normalized_question = _normalize_lookup_text(question)
     return bool(
@@ -957,6 +1357,7 @@ def _fee_program_title(question: str) -> str:
         _extract_program_abbreviation_from_text(question)
         or _extract_known_program_from_text(question)
         or _extract_program_hint_from_text(question)
+        or _extract_program_from_tokens(question)
     )
 
 
@@ -972,7 +1373,13 @@ def _is_quota_query(question: str) -> bool:
     return bool(QUOTA_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
 
+def _is_prep_query(question: str) -> bool:
+    return bool(PREP_QUERY_PATTERN.search(_normalize_lookup_text(question)))
+
+
 def _is_course_query(question: str) -> bool:
+    if _is_prep_query(question):
+        return False
     return bool(COURSE_QUERY_PATTERN.search(_normalize_lookup_text(question)))
 
 
@@ -1028,6 +1435,7 @@ def _course_program_title(question: str) -> str:
         or _extract_course_program_from_text(question)
         or _extract_known_program_from_text(question)
         or _extract_program_hint_from_text(question)
+        or _extract_program_from_tokens(question)
     )
 
 
@@ -1075,7 +1483,80 @@ def _mentions_english(value: str) -> bool:
     return 'ingilizce' in normalized or 'i ngilizce' in normalized
 
 
+_topic_centroids: dict[str, list[float]] | None = None
+_topic_centroids_lock = threading.Lock()
+_request_topics_key = '_semantic_request_topics'
+
+
+def _get_topic_centroids() -> dict[str, list[float]]:
+    global _topic_centroids
+    if _topic_centroids is not None:
+        return _topic_centroids
+
+    with _topic_centroids_lock:
+        if _topic_centroids is not None:
+            return _topic_centroids
+
+        from scraper.embeddings import embed_texts
+        centroids: dict[str, list[float]] = {}
+        for topic, descriptions in TOPIC_DESCRIPTIONS.items():
+            embeddings = embed_texts(descriptions)
+            dim = len(embeddings[0])
+            centroid = [0.0] * dim
+            for emb in embeddings:
+                for i in range(dim):
+                    centroid[i] += emb[i]
+            n = len(embeddings)
+            centroid = [c / n for c in centroid]
+            norm = sum(c ** 2 for c in centroid) ** 0.5
+            if norm > 0:
+                centroid = [c / norm for c in centroid]
+            centroids[topic] = centroid
+
+        _topic_centroids = centroids
+        return _topic_centroids
+
+
+def _semantic_question_topics(query_embedding: list[float]) -> set[str]:
+    if not settings.SEMANTIC_TOPIC_ENABLED:
+        return set()
+    centroids = _get_topic_centroids()
+    topics: set[str] = set()
+    threshold = settings.SEMANTIC_TOPIC_THRESHOLD
+    for topic, centroid in centroids.items():
+        sim = sum(q * c for q, c in zip(query_embedding, centroid))
+        if sim > threshold:
+            topics.add(topic)
+    return topics
+
+
+def _set_request_topics(topics: set[str]) -> None:
+    setattr(_thread_local, _request_topics_key, topics)
+
+
+def _clear_request_topics() -> None:
+    setattr(_thread_local, _request_topics_key, None)
+
+
+_HIGH_CONFIDENCE_ANSWER_TYPES = frozenset({'staff', 'program', 'score', 'fee', 'course', 'general_info'})
+
+
+def _should_bypass_structured_answer(answer_type: str) -> bool:
+    if settings.ANSWER_MODE == 'llm_preferred':
+        return True
+    if settings.ANSWER_MODE == 'hybrid':
+        return answer_type not in _HIGH_CONFIDENCE_ANSWER_TYPES
+    return False
+
+
 def _question_topics(question: str) -> set[str]:
+    cached = getattr(_thread_local, _request_topics_key, None)
+    if cached is not None:
+        return cached
+    return _regex_question_topics(question)
+
+
+def _regex_question_topics(question: str) -> set[str]:
     normalized_question = _normalize_lookup_text(question)
     topics: set[str] = set()
     if SCHOLARSHIP_QUERY_PATTERN.search(normalized_question):
@@ -1092,13 +1573,27 @@ def _question_topics(question: str) -> set[str]:
         topics.add('sports')
     if CAMPUS_LIFE_QUERY_PATTERN.search(normalized_question):
         topics.add('campus_life')
+    if STUDENT_CLUB_QUERY_PATTERN.search(normalized_question):
+        topics.add('student_clubs')
+    if TRANSPORT_QUERY_PATTERN.search(normalized_question):
+        topics.add('transport')
+    if PREP_QUERY_PATTERN.search(normalized_question):
+        topics.add('prep')
+    if COMPARISON_QUERY_PATTERN.search(normalized_question):
+        topics.add('comparison')
     return topics
 
 
 def _query_expansion_topics(question: str) -> set[str]:
     if not settings.RAG_QUERY_EXPANSION_ENABLED:
         return set()
-    if _is_staff_query(question) or _is_fee_query(question) or _is_score_query(question) or _is_course_query(question):
+    if (
+        _is_staff_query(question)
+        or _is_fee_query(question)
+        or _is_score_query(question)
+        or _is_course_query(question)
+        or _is_program_list_query(question)
+    ):
         return set()
     topics = _question_topics(question)
     if topics:
@@ -1130,6 +1625,7 @@ def _chunk_matches_question_topic(question_topics: set[str], chunk: ContentChunk
     if topic in question_topics:
         return True
 
+    source_group = _get_chunk_metadata_value(chunk, 'source_group')
     searchable_text = _normalize_lookup_text(
         ' '.join(
             [
@@ -1142,9 +1638,38 @@ def _chunk_matches_question_topic(question_topics: set[str], chunk: ContentChunk
         )
     )
     for question_topic in question_topics:
-        for keyword in TOPIC_KEYWORDS.get(question_topic, ()) + QUERY_EXPANSIONS.get(question_topic, ()):
+        if source_group in _TOPIC_EXCLUDED_SOURCE_GROUPS.get(question_topic, frozenset()):
+            continue
+        keywords = _TOPIC_MATCH_TERMS.get(
+            question_topic,
+            TOPIC_KEYWORDS.get(question_topic, ()) + QUERY_EXPANSIONS.get(question_topic, ()),
+        )
+        for keyword in keywords:
             if _normalize_lookup_text(keyword) in searchable_text:
                 return True
+    return False
+
+
+_NON_ACADEMIC_TOPICS = frozenset({
+    'campus_life', 'student_clubs', 'sports', 'library', 'dormitory',
+    'international', 'scholarships', 'transport', 'prep',
+})
+_BOLOGNA_ACADEMIC_KINDS = frozenset({'bologna_staff_page', 'bologna_program_page'})
+_BOLOGNA_ACADEMIC_RECORD_TYPES = frozenset({
+    'academic_staff_member', 'program_yeterlikleri',
+    'bologna_program_overview', 'bologna_semester_plan',
+})
+
+
+def _is_chunk_excluded_for_topics(topics: set[str], chunk: ContentChunk) -> bool:
+    if not (topics & _NON_ACADEMIC_TOPICS):
+        return False
+    if chunk.page.source != 'bologna':
+        return False
+    kind = _get_chunk_metadata_value(chunk, 'kind')
+    record_type = _get_chunk_metadata_value(chunk, 'record_type')
+    if kind in _BOLOGNA_ACADEMIC_KINDS or record_type in _BOLOGNA_ACADEMIC_RECORD_TYPES:
+        return True
     return False
 
 
@@ -1225,6 +1750,19 @@ def _chunk_priority(question: str, chunk: ContentChunk) -> int:
             return 2
         return 5
 
+    if _is_program_list_query(question):
+        if record_type == 'bologna_program_overview':
+            return 0
+        if kind == 'bologna_program_page' and _get_chunk_metadata_value(chunk, 'program_title'):
+            return 1
+        if kind == 'main_site_page' and _get_chunk_metadata_value(chunk, 'program_title') == 'Bölümler':
+            return 1
+        if kind in {'structured_admissions_score', 'structured_admissions_fee', 'main_site_staff_page'}:
+            return 5
+        if record_type in {'quota_row', 'tuition_fee', 'academic_staff_member'}:
+            return 5
+        return 3
+
     question_topics = _question_topics(question)
     if question_topics:
         if _chunk_matches_question_topic(question_topics, chunk):
@@ -1245,7 +1783,87 @@ def _sort_candidate_chunks(question: str, chunks: list[ContentChunk]) -> list[Co
     ]
 
 
+def _program_list_chunk_sort_key(question: str, chunk: ContentChunk) -> tuple[int, str, str]:
+    record_type = _get_chunk_metadata_value(chunk, 'record_type')
+    kind = _get_chunk_metadata_value(chunk, 'kind')
+    title = chunk.page.title
+    if record_type == 'bologna_program_overview':
+        priority = 0
+    elif 'Programı Bilgileri' in title or 'Programi Bilgileri' in title:
+        priority = 1
+    elif kind == 'bologna_program_page' and _get_chunk_metadata_value(chunk, 'program_title'):
+        priority = 2
+    elif kind == 'main_site_page' and _get_chunk_metadata_value(chunk, 'program_title') == 'Bölümler':
+        priority = 3
+    else:
+        priority = 4
+    return (
+        priority,
+        _normalize_lookup_text(_get_chunk_metadata_value(chunk, 'program_title') or title),
+        title,
+    )
+
+
+def _program_list_chunks_for_context(question: str, chunks: list[ContentChunk]) -> list[ContentChunk]:
+    if not _is_program_list_query(question):
+        return chunks
+
+    selected_by_program: dict[str, ContentChunk] = {}
+    list_chunks: list[ContentChunk] = []
+    for chunk in sorted(chunks, key=lambda item: _program_list_chunk_sort_key(question, item)):
+        program_title = _get_chunk_metadata_value(chunk, 'program_title')
+        normalized_program = _normalize_lookup_text(program_title)
+        if _is_engineering_program_list_query(question) and not _is_engineering_and_natural_sciences_faculty_query(question):
+            if not _is_engineering_and_natural_sciences_chunk(chunk):
+                continue
+            if not re.search(r'\bm[üu]hendisli[ğg]i\b|\bmuhendisligi\b', normalized_program):
+                continue
+        if program_title and program_title != 'Bölümler':
+            selected_by_program.setdefault(normalized_program, chunk)
+            continue
+        if _get_chunk_metadata_value(chunk, 'program_title') == 'Bölümler':
+            list_chunks.append(chunk)
+
+    selected = list(selected_by_program.values())
+    if selected:
+        return selected[:settings.RAG_RETRIEVE_LIMIT]
+    return list_chunks[:settings.RAG_RETRIEVE_LIMIT] or chunks
+
+
 def _filter_candidates_for_query(question: str, chunks: list[ContentChunk]) -> list[ContentChunk]:
+    if _is_program_list_query(question):
+        program_chunks = []
+        for chunk in chunks:
+            kind = _get_chunk_metadata_value(chunk, 'kind')
+            record_type = _get_chunk_metadata_value(chunk, 'record_type')
+            program_title = _get_chunk_metadata_value(chunk, 'program_title')
+            if kind in {'structured_admissions_score', 'structured_admissions_fee', 'main_site_staff_page'}:
+                continue
+            if record_type in {'quota_row', 'tuition_fee', 'academic_staff_member'}:
+                continue
+            if _get_chunk_metadata_value(chunk, 'source_group') in {'quota', 'tuition'}:
+                continue
+            if _get_chunk_metadata_value(chunk, 'record_type') == 'cap_combination':
+                continue
+            if _is_engineering_program_list_query(question):
+                if not _is_engineering_and_natural_sciences_chunk(chunk):
+                    continue
+                if program_title and not re.search(r'\bm[üu]hendisli[ğg]i\b|\bmuhendisligi\b', _normalize_lookup_text(program_title)):
+                    continue
+                if not program_title and not re.search(r'\bm[üu]hendisli[ğg]i\b|\bmuhendisligi\b', _normalize_lookup_text(chunk.text)):
+                    continue
+            if (
+                record_type == 'bologna_program_overview'
+                or (kind == 'bologna_program_page' and program_title)
+                or (
+                    kind == 'main_site_page'
+                    and _get_chunk_metadata_value(chunk, 'program_title') == 'Bölümler'
+                )
+            ):
+                program_chunks.append(chunk)
+        if program_chunks:
+            return sorted(program_chunks, key=lambda chunk: _chunk_priority(question, chunk))
+
     if _is_staff_query(question):
         role_chunks = [
             chunk
@@ -1310,6 +1928,7 @@ def _filter_candidates_for_query(question: str, chunks: list[ContentChunk]) -> l
             chunk
             for chunk in chunks
             if _chunk_matches_question_topic(question_topics, chunk)
+            and not _is_chunk_excluded_for_topics(question_topics, chunk)
         ]
 
     return chunks
@@ -1338,12 +1957,23 @@ def _question_specific_prompt_rules(question: str) -> list[str]:
         rules.append('Ücret sorularında yalnızca resmi öğrenim ücreti veya ilgili aday öğrenci kaynaklarını kullan.')
     elif _is_course_query(question):
         rules.append('Ders planı ve AKTS sorularında öncelikle müfredat yılı ve dönem metadata bilgilerini dikkate al.')
+    elif _is_program_list_query(question):
+        rules.append(
+            'Bölüm veya program listeleme sorularında yalnızca verilen program listesi ve program overview kaynaklarındaki distinct program adlarını listele.'
+        )
+        rules.append(
+            'Kontenjan-puan, akademik kadro, ücret veya yandal kaynaklarından bölüm/program varlığı sonucu çıkarma.'
+        )
     elif _question_topics(question):
         topics = _question_topics(question)
-        if topics & {'library', 'sports', 'campus_life'}:
+        if 'student_clubs' in topics:
+            rules.append('Öğrenci kulübü sorularında yalnızca kulüp liste veya kulüp detay kaynaklarını kullan.')
+        elif topics & {'library', 'sports', 'campus_life'}:
             rules.append('Kütüphane, spor merkezi ve kampüs olanakları sorularında yalnızca ilgili tesis kaynaklarını kullan.')
             if 'campus_life' in topics:
                 rules.append('Kampüs olanakları sorularında yurt, spor, kütüphane, yemekhane ve sosyal tesis bilgilerini bağlamda varsa birleştirerek cevapla.')
+        elif topics & {'transport', 'prep'}:
+            rules.append('Yalnızca ilgili konuya ait sayfa kaynaklarını kullan, akademik Bologna sayfalarını kullanma.')
         else:
             rules.append('Burs, yurt, Erasmus, uluslararası olanak veya ÇAP-yandal sorularında yalnızca ilgili konu kaynaklarını kullan.')
     return rules
@@ -1366,6 +1996,8 @@ def _build_structured_score_answer(question: str, chunks: list[ContentChunk]) ->
     wants_quota = _is_quota_query(question)
     if not any((wants_rank, wants_points, wants_quota)):
         wants_rank = True
+        wants_points = True
+        wants_quota = True
 
     def _sort_key(chunk: ContentChunk) -> tuple[int, str]:
         placement_type = _normalize_lookup_text(_get_chunk_metadata_value(chunk, 'placement_type'))
@@ -1906,17 +2538,46 @@ def _looks_like_navigation(text: str) -> bool:
     return False
 
 
-def _build_facility_info_answer(question: str, chunks: list[ContentChunk]) -> str:
+_FACILITY_NOISE_PAGE_PATTERNS = re.compile(
+    r'sürdürülebilir|i̇klim|sürdürülebilirlik|iklim|başarı\s*sıras'
+    r'|burs\b|bursu|öğrenim\s*ücret|i̇ndirim|öden|kontenjan'
+    r'|acu-burs|aydinlar\s*ünivers',
+    re.IGNORECASE,
+)
+_FACILITY_NOISE_KINDS = frozenset({
+    'structured_admissions_score',
+    'structured_admissions_fee',
+})
+_FACILITY_NOISE_RECORD_TYPES = frozenset({
+    'scholarship_rule',
+    'candidate_requirement',
+    'tuition_fee',
+    'quota_row',
+})
+
+
+def _build_facility_info_answer(question: str, chunks: list[ContentChunk]) -> tuple[str, list[ContentChunk]]:
     topics = _question_topics(question)
-    facility_topics = topics & {'library', 'sports', 'campus_life'}
+    facility_topics = topics & {'library', 'sports', 'campus_life', 'student_clubs'}
     if not facility_topics:
-        return ''
+        return '', []
 
     library_chunks = []
     sports_chunks = []
     campus_chunks = []
+    club_chunks = []
+    used_chunks: list[ContentChunk] = []
     for chunk in chunks:
         searchable = _normalize_lookup_text(chunk.text[:1000])
+        page_title_normalized = _normalize_lookup_text(chunk.page.title)
+        if _FACILITY_NOISE_PAGE_PATTERNS.search(page_title_normalized):
+            continue
+        kind = _get_chunk_metadata_value(chunk, 'kind')
+        if kind in _FACILITY_NOISE_KINDS:
+            continue
+        record_type = _get_chunk_metadata_value(chunk, 'record_type')
+        if record_type in _FACILITY_NOISE_RECORD_TYPES:
+            continue
         if 'library' in facility_topics and re.search(r'\bk[uü]t[uü]phane', _normalize_lookup_text(chunk.page.title)):
             library_chunks.append(chunk)
         elif 'library' in facility_topics and re.search(r'\bkütüphane|\bkutuphane', searchable):
@@ -1928,9 +2589,14 @@ def _build_facility_info_answer(question: str, chunks: list[ContentChunk]) -> st
             searchable,
         ):
             campus_chunks.append(chunk)
+        if 'student_clubs' in facility_topics and re.search(
+            r'\b(kulüp|kulup|kulub|topluluk|öğrenci kulüpleri|ogrenci kulupleri)\b',
+            searchable,
+        ):
+            club_chunks.append(chunk)
 
-    if not library_chunks and not sports_chunks and not campus_chunks:
-        return ''
+    if not library_chunks and not sports_chunks and not campus_chunks and not club_chunks:
+        return '', []
 
     lines: list[str] = []
     if library_chunks:
@@ -1938,6 +2604,7 @@ def _build_facility_info_answer(question: str, chunks: list[ContentChunk]) -> st
             library_chunks, re.compile(r'\bkütüphane|\bkutuphane|\blibrary', re.IGNORECASE)
         )
         if lib_excerpts:
+            used_chunks.extend(library_chunks)
             lines.append('Kütüphane:')
             for excerpt in lib_excerpts:
                 lines.append(f'- {excerpt}')
@@ -1946,6 +2613,7 @@ def _build_facility_info_answer(question: str, chunks: list[ContentChunk]) -> st
             sports_chunks, re.compile(r'\bspor\b|\bfitness\b|\byüzme|\bbasketbol|\bhavuz', re.IGNORECASE)
         )
         if sport_excerpts:
+            used_chunks.extend(sports_chunks)
             lines.append('Spor Merkezi:')
             for excerpt in sport_excerpts:
                 lines.append(f'- {excerpt}')
@@ -1958,13 +2626,27 @@ def _build_facility_info_answer(question: str, chunks: list[ContentChunk]) -> st
             ),
         )
         if campus_excerpts:
+            used_chunks.extend(campus_chunks)
             lines.append('Kampüs Olanakları:')
             for excerpt in campus_excerpts:
                 lines.append(f'- {excerpt}')
+    if club_chunks:
+        club_excerpts = _extract_facility_excerpts(
+            club_chunks,
+            re.compile(
+                r'\b(kulüp|kulup|kulub|topluluk|öğrenci kulüpleri|ogrenci kulupleri)\b',
+                re.IGNORECASE,
+            ),
+        )
+        if club_excerpts:
+            used_chunks.extend(club_chunks)
+            lines.append('Öğrenci Kulüpleri:')
+            for excerpt in club_excerpts:
+                lines.append(f'- {excerpt}')
 
     if not lines:
-        return ''
-    return '\n'.join(lines)
+        return '', []
+    return '\n'.join(lines), used_chunks
 
 
 def _staff_member_chunks_for_context(chunks: list[ContentChunk]) -> list[ContentChunk]:
@@ -2237,6 +2919,7 @@ def _build_program_presence_answer(question: str, chunks: list[ContentChunk]) ->
         _extract_program_abbreviation_from_text(question)
         or _extract_known_program_from_text(question)
         or _extract_program_hint_from_text(question)
+        or _extract_program_from_tokens(question)
     )
     if not program_title:
         return ''
@@ -2279,9 +2962,10 @@ def _build_program_presence_answer(question: str, chunks: list[ContentChunk]) ->
 
 
 def _vector_distance_threshold(question: str) -> float:
-    if _is_general_info_query(question) or _question_topics(question):
-        return settings.RAG_VECTOR_DISTANCE_BROAD
-    return settings.RAG_VECTOR_DISTANCE_STRICT
+    if (_is_score_query(question) or _is_fee_query(question)
+            or _is_staff_query(question) or _is_course_query(question)):
+        return settings.RAG_VECTOR_DISTANCE_STRICT
+    return settings.RAG_VECTOR_DISTANCE_BROAD
 
 
 def retrieve_context(
@@ -2371,6 +3055,39 @@ def _sort_candidate_hits(question: str, hits: list[RetrievalHit]) -> list[Conten
     ]
 
 
+def _retrieve_direct_program_list_chunks(question: str, limit: int) -> list[ContentChunk]:
+    if not _is_program_list_query(question):
+        return []
+
+    queryset = ContentChunk.objects.select_related('page').filter(page__is_active=True)
+    faculty_lookup = (
+        Q(metadata__faculty__icontains='Mühendislik ve Doğa Bilimleri')
+        | Q(page__title__icontains='Mühendislik ve Doğa Bilimleri')
+        | Q(text__icontains='Mühendislik ve Doğa Bilimleri')
+    )
+    program_source_lookup = (
+        Q(metadata__record_type='bologna_program_overview')
+        | Q(metadata__kind='bologna_program_page')
+        | (
+            Q(metadata__kind='main_site_page')
+            & Q(metadata__program_title='Bölümler')
+        )
+    )
+    queryset = queryset.filter(faculty_lookup).filter(program_source_lookup)
+
+    if _is_engineering_program_list_query(question) and not _is_engineering_and_natural_sciences_faculty_query(question):
+        engineering_lookup = (
+            Q(metadata__program_title__icontains='Mühendisliği')
+            | Q(metadata__program_title__icontains='Muhendisligi')
+            | Q(page__title__icontains='Mühendisliği')
+            | Q(page__title__icontains='Muhendisligi')
+        )
+        queryset = queryset.filter(engineering_lookup)
+
+    chunks = list(queryset.order_by('metadata__program_title', 'page_id', 'chunk_index')[: limit * 2])
+    return _limit_chunks(chunks, limit=limit, per_page_limit=1)
+
+
 def _retrieve_direct_score_chunks(question: str, limit: int) -> list[ContentChunk]:
     if not _is_score_query(question):
         return []
@@ -2379,6 +3096,7 @@ def _retrieve_direct_score_chunks(question: str, limit: int) -> list[ContentChun
         _extract_program_abbreviation_from_text(question)
         or _extract_known_program_from_text(question)
         or _extract_program_hint_from_text(question)
+        or _extract_program_from_tokens(question)
     )
 
     program_lookup = Q()
@@ -2423,6 +3141,14 @@ def _direct_candidate_hits(question: str, candidate_limit: int) -> list[Retrieva
     )
     hits.extend(
         _chunks_to_hits(
+            _retrieve_direct_program_list_chunks(question, limit=candidate_limit),
+            method='direct_program_list',
+            weight=4.0,
+            protected=_is_program_list_query(question),
+        )
+    )
+    hits.extend(
+        _chunks_to_hits(
             _retrieve_direct_score_chunks(question, limit=candidate_limit),
             method='direct_score',
             weight=2.0,
@@ -2450,7 +3176,7 @@ def _direct_candidate_hits(question: str, candidate_limit: int) -> list[Retrieva
             _retrieve_direct_facility_chunks(question, limit=candidate_limit * 2),
             method='direct_facility',
             weight=3.0,
-            protected=bool(_question_topics(question) & {'library', 'sports', 'campus_life'}),
+            protected=bool(_question_topics(question) & {'library', 'sports', 'campus_life', 'student_clubs', 'dormitory', 'international', 'transport', 'prep', 'scholarships'}),
         )
     )
     return hits
@@ -2517,10 +3243,7 @@ def _truncate_context_text(text: str, max_chars: int) -> str:
 
 
 def _prompt_context_char_limit(question: str) -> int:
-    max_context_chars = settings.RAG_MAX_CONTEXT_CHARS
-    if _is_general_info_query(question) or (_question_topics(question) & {'library', 'sports', 'campus_life'}):
-        return max_context_chars * 2
-    return max_context_chars
+    return settings.RAG_MAX_CONTEXT_CHARS
 
 
 def _select_prompt_chunks(question: str, chunks: list[ContentChunk]) -> list[tuple[ContentChunk, str]]:
@@ -2600,10 +3323,17 @@ def build_prompt(question: str, chunks: list[ContentChunk]) -> tuple[str, list[C
     additional_rules = _question_specific_prompt_rules(question)
     rules_block = ''.join(f'- {rule}\n' for rule in additional_rules) if additional_rules else ''
     prompt = (
+        '/no_think\n'
         'Sen Acıbadem Üniversitesi için resmi kaynaklardan cevap veren bir asistansın.\n'
         'Yalnızca verilen bağlama dayan.\n'
-        'Bağlamda ilgili bilgi varsa bu bilgiden yararlanarak cevap ver, eksik kısımları belirt.\n'
-        'Bağlamda hiç ilgili bilgi yoksa bunu açıkça söyle.\n'
+        'Cevap biçimi: yalnızca kullanıcıya gösterilecek nihai Türkçe cevabı yaz.\n'
+        'Yanıtına tam olarak "CEVAP:" ile başla; bu etiketin öncesine hiçbir metin yazma.\n'
+        'Kaynakları nasıl incelediğini, analiz sürecini, İngilizce taslağı veya "Possible answer" gibi ara notları yazma.\n'
+        '<think>, </think> veya benzeri muhakeme etiketi üretme.\n'
+        'Bağlamda soruyla ilgili bilgi varsa bu bilgiden yararlanarak cevap ver.\n'
+        'Eksik kısımlar varsa mevcut bilgiyi paylaşıp hangi kısımların eksik olduğunu belirt.\n'
+        'Bağlamda hiç ilgili bilgi yoksa bunu açıkça söyle, tahmin yürütme.\n'
+        'Sıralama, karşılaştırma veya istatistik gerektiren sorularda veri yoksa cevap uydurma.\n'
         'Program veya fakülte odaklı sorularda yalnızca metadata olarak eşleşen kaynakları kullan.\n'
         'Cevabı Türkçe ver.\n'
         'Metin içinde kaynak numaralarını [1], [2] gibi kullan.\n\n'
@@ -2618,16 +3348,27 @@ def generate_answer(prompt: str) -> str:
     messages = [
         {
             'role': 'system',
-            'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
+            'content': _llm_system_prompt(),
         },
         {'role': 'user', 'content': prompt},
     ]
     if _use_ollama_backend():
-        return _ollama_chat(
+        answer = _ollama_chat(
             messages,
             temperature=0.1,
             max_tokens=settings.LLM_MAX_TOKENS,
         )
+        if _is_llm_format_error_answer(answer):
+            retry_messages = [
+                {'role': 'system', 'content': _llm_system_prompt()},
+                {'role': 'user', 'content': _llm_retry_prompt(prompt)},
+            ]
+            answer = _ollama_chat(
+                retry_messages,
+                temperature=0,
+                max_tokens=settings.LLM_MAX_TOKENS,
+            )
+        return answer
 
     response = get_llm_client().chat.completions.create(
         model=settings.LLM_MODEL,
@@ -2635,7 +3376,20 @@ def generate_answer(prompt: str) -> str:
         max_tokens=settings.LLM_MAX_TOKENS,
         messages=messages,
     )
-    return (response.choices[0].message.content or '').strip()
+    answer = _clean_llm_answer(response.choices[0].message.content or '')
+    if _is_llm_format_error_answer(answer):
+        retry_messages = [
+            {'role': 'system', 'content': _llm_system_prompt()},
+            {'role': 'user', 'content': _llm_retry_prompt(prompt)},
+        ]
+        response = get_llm_client().chat.completions.create(
+            model=settings.LLM_MODEL,
+            temperature=0,
+            max_tokens=settings.LLM_MAX_TOKENS,
+            messages=retry_messages,
+        )
+        answer = _clean_llm_answer(response.choices[0].message.content or '')
+    return answer
 
 
 def _generate_answer_with_slot(prompt: str) -> str:
@@ -2670,16 +3424,34 @@ def generate_answer_stream(prompt: str) -> Iterator[str]:
     messages = [
         {
             'role': 'system',
-            'content': 'Resmi üniversite kaynağına dayalı, kısa ve net cevaplar ver.',
+            'content': _llm_system_prompt(),
         },
         {'role': 'user', 'content': prompt},
     ]
     if _use_ollama_backend():
-        yield from _ollama_chat_stream(
-            messages,
-            temperature=0.1,
-            max_tokens=settings.LLM_MAX_TOKENS,
+        raw_answer = ''.join(
+            _ollama_chat_stream(
+                messages,
+                temperature=0.1,
+                max_tokens=settings.LLM_MAX_TOKENS,
+            )
         )
+        cleaned_answer = _clean_llm_answer(raw_answer)
+        if _is_llm_format_error_answer(cleaned_answer):
+            retry_messages = [
+                {'role': 'system', 'content': _llm_system_prompt()},
+                {'role': 'user', 'content': _llm_retry_prompt(prompt)},
+            ]
+            raw_answer = ''.join(
+                _ollama_chat_stream(
+                    retry_messages,
+                    temperature=0,
+                    max_tokens=settings.LLM_MAX_TOKENS,
+                )
+            )
+            cleaned_answer = _clean_llm_answer(raw_answer)
+        if cleaned_answer:
+            yield cleaned_answer
         return
 
     stream = get_llm_client().chat.completions.create(
@@ -2689,11 +3461,34 @@ def generate_answer_stream(prompt: str) -> Iterator[str]:
         messages=messages,
         stream=True,
     )
+    answer_parts: list[str] = []
     for chunk in stream:
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta.content
-        yield from _iter_delta_content_text(delta)
+        answer_parts.extend(_iter_delta_content_text(delta))
+    cleaned_answer = _clean_llm_answer(''.join(answer_parts))
+    if _is_llm_format_error_answer(cleaned_answer):
+        retry_messages = [
+            {'role': 'system', 'content': _llm_system_prompt()},
+            {'role': 'user', 'content': _llm_retry_prompt(prompt)},
+        ]
+        stream = get_llm_client().chat.completions.create(
+            model=settings.LLM_MODEL,
+            temperature=0,
+            max_tokens=settings.LLM_MAX_TOKENS,
+            messages=retry_messages,
+            stream=True,
+        )
+        retry_parts: list[str] = []
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content
+            retry_parts.extend(_iter_delta_content_text(delta))
+        cleaned_answer = _clean_llm_answer(''.join(retry_parts))
+    if cleaned_answer:
+        yield cleaned_answer
 
 
 def _generate_answer_stream_with_slot(prompt: str) -> Iterator[str]:
@@ -2795,7 +3590,7 @@ def _retrieve_direct_program_chunks(question: str, limit: int) -> list[ContentCh
             page__title__icontains='Ağız ve Diş Sağlığı'
         )
     else:
-        program_title = _extract_known_program_from_text(question) or _extract_program_hint_from_text(question)
+        program_title = _extract_known_program_from_text(question) or _extract_program_hint_from_text(question) or _extract_program_from_tokens(question)
         if not program_title:
             return []
         lookups = Q()
@@ -2881,45 +3676,144 @@ def _retrieve_direct_course_chunks(question: str, limit: int) -> list[ContentChu
     )[:limit]
 
 
+def _retrieve_direct_student_club_chunks(limit: int) -> list[ContentChunk]:
+    club_title_lookup = (
+        Q(page__title__icontains='Öğrenci Kulüpleri')
+        | Q(page__title__icontains='Ogrenci Kulupleri')
+        | Q(page__title__icontains='Kulübü')
+        | Q(page__title__icontains='Kulubu')
+        | Q(page__title__icontains='Topluluğu')
+        | Q(page__title__icontains='Toplulugu')
+    )
+    queryset = (
+        ContentChunk.objects.select_related('page')
+        .filter(page__is_active=True)
+        .filter(Q(metadata__topic='student_clubs') | club_title_lookup)
+        .order_by('page_id', 'chunk_index')
+    )
+    return list(queryset[:limit])
+
+
 def _retrieve_direct_facility_chunks(question: str, limit: int) -> list[ContentChunk]:
     topics = _question_topics(question)
-    facility_topics = topics & {'library', 'sports', 'campus_life'}
-    if not facility_topics:
+    facility_topics = topics & {'library', 'sports', 'campus_life', 'student_clubs'}
+    all_topic = topics & {'transport', 'prep', 'scholarships', 'dormitory', 'international'}
+    if not (facility_topics or all_topic):
         return []
+
+    if 'student_clubs' in facility_topics:
+        club_hits = _retrieve_direct_student_club_chunks(limit)
+        if club_hits and facility_topics == {'student_clubs'} and not all_topic:
+            return club_hits
 
     text_lookup = Q()
     title_lookup = Q()
-    if 'library' in facility_topics:
-        for term in QUERY_EXPANSIONS['library']:
-            text_lookup |= Q(text__icontains=term) | Q(page__title__icontains=term)
-            title_lookup |= Q(page__title__icontains=term)
-    if 'sports' in facility_topics:
-        for term in QUERY_EXPANSIONS['sports']:
-            text_lookup |= Q(text__icontains=term) | Q(page__title__icontains=term)
-            title_lookup |= Q(page__title__icontains=term)
-    if 'campus_life' in facility_topics:
-        for term in QUERY_EXPANSIONS['campus_life']:
+    for topic_key in facility_topics | all_topic:
+        if topic_key not in QUERY_EXPANSIONS:
+            continue
+        for term in QUERY_EXPANSIONS[topic_key]:
             text_lookup |= Q(text__icontains=term) | Q(page__title__icontains=term)
             title_lookup |= Q(page__title__icontains=term)
 
+    base_queryset = ContentChunk.objects.select_related('page').filter(page__is_active=True)
+
     title_hits = (
-        ContentChunk.objects.select_related('page')
-        .filter(page__is_active=True)
+        base_queryset
         .filter(title_lookup)
         .order_by('page_id', 'chunk_index')
     )
     other_hits = (
-        ContentChunk.objects.select_related('page')
-        .filter(page__is_active=True)
+        base_queryset
         .filter(text_lookup)
         .exclude(title_lookup)
         .order_by('page_id', 'chunk_index')
     )
     results = list(title_hits[:limit])
+    if 'student_clubs' in facility_topics:
+        for chunk in reversed(_dedupe_chunks(club_hits)):
+            if chunk not in results:
+                results.insert(0, chunk)
+        results = _dedupe_chunks(results)
+        if len(results) >= limit:
+            return results[:limit]
     remaining = limit - len(results)
     if remaining > 0:
         results.extend(list(other_hits[:remaining]))
+    if facility_topics & {'campus_life', 'student_clubs'}:
+        results = [
+            chunk
+            for chunk in results
+            if _get_chunk_metadata_value(chunk, 'source_group') not in {'scholarship', 'quota', 'tuition'}
+        ]
     return results
+
+
+def _is_chunk_protected_for_rerank(question: str, chunk: ContentChunk) -> bool:
+    kind = _get_chunk_metadata_value(chunk, 'kind')
+    record_type = _get_chunk_metadata_value(chunk, 'record_type')
+    if _is_score_query(question) and kind == 'structured_admissions_score':
+        return True
+    if _is_score_query(question) and record_type == 'quota_row':
+        return True
+    if _is_fee_query(question) and kind == 'structured_admissions_fee':
+        return True
+    if _is_fee_query(question) and record_type == 'tuition_fee':
+        return True
+    if _is_staff_query(question) and kind == 'main_site_role_page':
+        return True
+    if _is_staff_query(question) and record_type in {'department_head_message', 'staff_role_assignment'}:
+        return True
+    if _is_program_list_query(question) and (
+        record_type == 'bologna_program_overview'
+        or (kind == 'bologna_program_page' and _get_chunk_metadata_value(chunk, 'program_title'))
+    ):
+        return True
+    topics = _question_topics(question)
+    if topics and _chunk_matches_question_topic(topics, chunk):
+        return True
+    return False
+
+
+def _rerank_candidates(question: str, chunks: list[ContentChunk]) -> list[ContentChunk]:
+    from scraper.embeddings import rerank_texts
+
+    if not settings.RERANK_ENABLED:
+        return chunks
+    if len(chunks) <= settings.RERANK_OUTPUT_LIMIT:
+        return chunks
+
+    protected = [c for c in chunks if _is_chunk_protected_for_rerank(question, c)]
+    unprotected = [c for c in chunks if not _is_chunk_protected_for_rerank(question, c)]
+
+    if not unprotected:
+        return chunks
+
+    candidates = unprotected[:settings.RERANK_CANDIDATE_LIMIT]
+    candidate_texts = [_truncate_context_text(c.text, 500) for c in candidates]
+
+    try:
+        reranked = rerank_texts(
+            query=question,
+            documents=candidate_texts,
+            top_k=settings.RERANK_OUTPUT_LIMIT,
+        )
+    except Exception:
+        logger.exception("Rerank failed, falling back to original order")
+        return chunks
+
+    reranked_chunks = []
+    reranked_pks = set()
+    for original_idx, score in reranked:
+        if score >= settings.RERANK_MIN_SCORE:
+            chunk = candidates[original_idx]
+            reranked_chunks.append(chunk)
+            reranked_pks.add(chunk.pk)
+
+    remaining_unprotected = [
+        c for c in unprotected if c.pk not in reranked_pks
+    ]
+
+    return protected + reranked_chunks + remaining_unprotected
 
 
 def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[ContentChunk]:
@@ -2946,9 +3840,12 @@ def _retrieve_candidates(question: str, query_embedding: list[float]) -> list[Co
     )
     combined = _sort_candidate_hits(question, hits)
     combined = _filter_candidates_for_query(question, combined)
+    combined = _rerank_candidates(question, combined)
+    if _is_program_list_query(question):
+        return _program_list_chunks_for_context(question, combined)
     if _is_course_query(question):
         combined = sorted(combined, key=lambda chunk: _course_sort_key(question, chunk))
-    facility_topics = _question_topics(question) & {'library', 'sports', 'campus_life'}
+    facility_topics = _question_topics(question) & {'library', 'sports', 'campus_life', 'student_clubs', 'dormitory', 'international', 'transport', 'prep', 'scholarships'}
     if facility_topics:
         return _limit_chunks(
             combined,
@@ -3032,9 +3929,17 @@ def _prepare_chat_context(question: str, conversation: Conversation) -> dict:
     query_embedding = embed_query(resolved_question)
     timings['embed_ms'] = _elapsed_ms(embed_start)
 
-    retrieve_start = perf_counter()
-    all_chunks = _retrieve_candidates(resolved_question, query_embedding)
-    timings['retrieve_ms'] = _elapsed_ms(retrieve_start)
+    semantic_topics = _semantic_question_topics(query_embedding)
+    regex_topics = _regex_question_topics(resolved_question)
+    combined_topics = regex_topics | semantic_topics
+    _set_request_topics(combined_topics)
+
+    try:
+        retrieve_start = perf_counter()
+        all_chunks = _retrieve_candidates(resolved_question, query_embedding)
+        timings['retrieve_ms'] = _elapsed_ms(retrieve_start)
+    finally:
+        _clear_request_topics()
     prompt = ''
     prompt_chars = 0
     prompt_start = perf_counter()
@@ -3084,7 +3989,7 @@ def _structured_sources(question: str, answer: str, chunks: list[ContentChunk]) 
                 if overview_chunks:
                     return build_sources(overview_chunks[:1])
             return build_sources(course_chunks)
-    if answer and _question_topics(question) & {'library', 'sports', 'campus_life'}:
+    if answer and _question_topics(question) & {'library', 'sports', 'campus_life', 'student_clubs', 'transport', 'prep', 'dormitory', 'international', 'scholarships'}:
         return build_sources(chunks)
     return None
 
@@ -3140,26 +4045,48 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
     prompt = context['prompt']
     prompt_chars = context['prompt_chars']
     llm_busy = False
+    facility_chunks: list[ContentChunk] = []
+    structured_answer = ''
+    answer_type = ''
     if not chunks:
         answer = NO_CONTEXT_ANSWER
         timings['llm_ms'] = 0.0
     else:
         structured_answer = _build_structured_staff_answer(resolved_question, retrieved_chunks)
+        if structured_answer:
+            answer_type = 'staff'
         if not structured_answer:
             structured_answer = _build_program_presence_answer(resolved_question, retrieved_chunks)
+            if structured_answer:
+                answer_type = 'program'
         if not structured_answer:
             structured_answer = _build_structured_score_answer(resolved_question, retrieved_chunks)
+            if structured_answer:
+                answer_type = 'score'
         if not structured_answer:
             structured_answer = _build_structured_fee_answer(resolved_question, retrieved_chunks)
+            if structured_answer:
+                answer_type = 'fee'
         if not structured_answer:
             structured_answer = _build_structured_course_answer(resolved_question, retrieved_chunks)
+            if structured_answer:
+                answer_type = 'course'
         if not structured_answer:
             structured_answer = _build_general_info_answer(resolved_question, retrieved_chunks)
+            if structured_answer:
+                answer_type = 'general_info'
         if not structured_answer:
-            structured_answer = _build_facility_info_answer(resolved_question, retrieved_chunks)
+            structured_answer, facility_chunks = _build_facility_info_answer(resolved_question, retrieved_chunks)
+            if structured_answer:
+                answer_type = 'facility'
+
+        if structured_answer and _should_bypass_structured_answer(answer_type):
+            structured_answer = ''
+
+        source_chunks = facility_chunks if facility_chunks else retrieved_chunks
         if structured_answer:
             answer = structured_answer
-            structured_sources = _structured_sources(resolved_question, answer, retrieved_chunks)
+            structured_sources = _structured_sources(resolved_question, answer, source_chunks)
             if structured_sources is not None:
                 sources = structured_sources
             timings['llm_ms'] = 0.0
@@ -3182,7 +4109,7 @@ def chat(question: str, conversation_id: int | None = None) -> dict:
         'cached': False,
         'busy': llm_busy,
     }
-    if not llm_busy:
+    if not llm_busy and not _is_llm_format_error_answer(answer):
         cache.set(
             context['key'],
             {'answer': answer, 'sources': sources},
@@ -3261,27 +4188,49 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
         chunks = context['chunks']
         retrieved_chunks = context['retrieved_chunks']
         answer = NO_CONTEXT_ANSWER
+        facility_chunks_stream: list[ContentChunk] = []
+        structured_answer = ''
+        answer_type_stream = ''
         llm_busy = False
         if not chunks:
             timings['llm_ms'] = 0.0
             yield _sse_event('token', {'text': answer})
         else:
             structured_answer = _build_structured_staff_answer(resolved_question, retrieved_chunks)
+            if structured_answer:
+                answer_type_stream = 'staff'
             if not structured_answer:
                 structured_answer = _build_program_presence_answer(resolved_question, retrieved_chunks)
+                if structured_answer:
+                    answer_type_stream = 'program'
             if not structured_answer:
                 structured_answer = _build_structured_score_answer(resolved_question, retrieved_chunks)
+                if structured_answer:
+                    answer_type_stream = 'score'
             if not structured_answer:
                 structured_answer = _build_structured_fee_answer(resolved_question, retrieved_chunks)
+                if structured_answer:
+                    answer_type_stream = 'fee'
             if not structured_answer:
                 structured_answer = _build_structured_course_answer(resolved_question, retrieved_chunks)
+                if structured_answer:
+                    answer_type_stream = 'course'
             if not structured_answer:
                 structured_answer = _build_general_info_answer(resolved_question, retrieved_chunks)
+                if structured_answer:
+                    answer_type_stream = 'general_info'
             if not structured_answer:
-                structured_answer = _build_facility_info_answer(resolved_question, retrieved_chunks)
+                structured_answer, facility_chunks_stream = _build_facility_info_answer(resolved_question, retrieved_chunks)
+                if structured_answer:
+                    answer_type_stream = 'facility'
+
+            if structured_answer and _should_bypass_structured_answer(answer_type_stream):
+                structured_answer = ''
+
+            source_chunks_stream = facility_chunks_stream if facility_chunks_stream else retrieved_chunks
             if structured_answer:
                 answer = structured_answer
-                structured_sources = _structured_sources(resolved_question, answer, retrieved_chunks)
+                structured_sources = _structured_sources(resolved_question, answer, source_chunks_stream)
                 if structured_sources is not None:
                     sources = structured_sources
                 timings['llm_ms'] = 0.0
@@ -3309,7 +4258,7 @@ def chat_stream(question: str, conversation_id: int | None = None) -> Iterator[s
 
         persist_start = perf_counter()
         _persist_exchange(conversation, question, answer)
-        if not llm_busy:
+        if not llm_busy and not _is_llm_format_error_answer(answer):
             cache.set(
                 context['key'],
                 {'answer': answer, 'sources': sources},

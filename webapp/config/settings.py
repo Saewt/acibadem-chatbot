@@ -107,9 +107,9 @@ LLM_DEFAULT_BASE_URL = (
 )
 LLM_BASE_URL = os.environ.get('LLM_BASE_URL', LLM_DEFAULT_BASE_URL).rstrip('/')
 LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen3:8b')
-LLM_THINK = _env_bool('LLM_THINK', True)
+LLM_THINK = _env_bool('LLM_THINK', False)
 LLM_WARMUP_ENABLED = _env_bool('LLM_WARMUP_ENABLED', False)
-LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', '512'))
+LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', '1536'))
 LLM_TIMEOUT = float(os.environ.get('LLM_TIMEOUT', '60'))
 LLM_MAX_CONCURRENT_REQUESTS = max(
     int(os.environ.get('LLM_MAX_CONCURRENT_REQUESTS', '1')),
@@ -126,14 +126,22 @@ EMBEDDING_API_URL = os.environ.get(
 EMBEDDING_API_TIMEOUT = int(os.environ.get('EMBEDDING_API_TIMEOUT', '30'))
 EMBEDDING_BATCH_SIZE = int(os.environ.get('EMBEDDING_BATCH_SIZE', '2'))
 CACHE_TTL = int(os.environ.get('CACHE_TTL', '3600'))
-RAG_RETRIEVE_LIMIT = int(os.environ.get('RAG_RETRIEVE_LIMIT', '3'))
+RAG_RETRIEVE_LIMIT = int(os.environ.get('RAG_RETRIEVE_LIMIT', '6'))
 RAG_PER_PAGE_LIMIT = int(os.environ.get('RAG_PER_PAGE_LIMIT', '3'))
-RAG_MAX_CHUNK_CHARS = int(os.environ.get('RAG_MAX_CHUNK_CHARS', '500'))
-RAG_MAX_CONTEXT_CHARS = int(os.environ.get('RAG_MAX_CONTEXT_CHARS', '1800'))
+RAG_MAX_CHUNK_CHARS = int(os.environ.get('RAG_MAX_CHUNK_CHARS', '800'))
+RAG_MAX_CONTEXT_CHARS = int(os.environ.get('RAG_MAX_CONTEXT_CHARS', '3600'))
 RAG_VECTOR_DISTANCE_STRICT = float(os.environ.get('RAG_VECTOR_DISTANCE_STRICT', '0.72'))
 RAG_VECTOR_DISTANCE_BROAD = float(os.environ.get('RAG_VECTOR_DISTANCE_BROAD', '0.85'))
 RAG_RRF_K = int(os.environ.get('RAG_RRF_K', '60'))
 RAG_QUERY_EXPANSION_ENABLED = _env_bool('RAG_QUERY_EXPANSION_ENABLED', True)
+RERANK_ENABLED = _env_bool('RERANK_ENABLED', True)
+RERANK_CANDIDATE_LIMIT = int(os.environ.get('RERANK_CANDIDATE_LIMIT', '18'))
+RERANK_OUTPUT_LIMIT = int(os.environ.get('RERANK_OUTPUT_LIMIT', '12'))
+RERANK_MIN_SCORE = float(os.environ.get('RERANK_MIN_SCORE', '-100.0'))
+RERANK_API_TIMEOUT = int(os.environ.get('RERANK_API_TIMEOUT', '30'))
+SEMANTIC_TOPIC_ENABLED = _env_bool('SEMANTIC_TOPIC_ENABLED', True)
+SEMANTIC_TOPIC_THRESHOLD = float(os.environ.get('SEMANTIC_TOPIC_THRESHOLD', '0.55'))
+ANSWER_MODE = os.environ.get('ANSWER_MODE', 'structured_first')
 CHAT_WARMUP_ENABLED = os.environ.get('CHAT_WARMUP_ENABLED', 'True') == 'True'
 ACIBADEM_DATASET_ROOT = os.environ.get(
     'ACIBADEM_DATASET_ROOT',

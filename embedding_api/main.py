@@ -7,7 +7,7 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -37,6 +37,9 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
 EMBEDDING_BATCH_SIZE = _env_int("EMBEDDING_BATCH_SIZE", 2)
+RERANK_MODEL = os.environ.get(
+    "RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
 TORCH_NUM_THREADS = _env_int("TORCH_NUM_THREADS", 1)
 MODEL_DIR = os.environ.get(
     "SENTENCE_TRANSFORMERS_HOME",
@@ -45,6 +48,8 @@ MODEL_DIR = os.environ.get(
 
 _model: Optional[SentenceTransformer] = None
 _ready: bool = False
+_rerank_model: Optional[CrossEncoder] = None
+_rerank_ready: bool = False
 
 
 def _select_device() -> str:
@@ -73,11 +78,22 @@ def _load_model() -> SentenceTransformer:
         cache_folder=MODEL_DIR,
     )
     _model = _model.to(device)
-    # warm-up encode
     _model.encode(["warmup"], normalize_embeddings=True, show_progress_bar=False)
     _ready = True
     logger.info("Embedding model ready device=%s", device)
     return _model
+
+
+def _load_rerank_model() -> CrossEncoder:
+    global _rerank_model, _rerank_ready
+    device = _select_device()
+    logger.info("Loading rerank model=%s device=%s", RERANK_MODEL, device)
+    _rerank_model = CrossEncoder(RERANK_MODEL, cache_folder=MODEL_DIR)
+    if device != "cpu":
+        _rerank_model.model.to(device)
+    _rerank_ready = True
+    logger.info("Rerank model ready device=%s", device)
+    return _rerank_model
 
 
 app = FastAPI(title="Embedding API")
@@ -86,10 +102,17 @@ app = FastAPI(title="Embedding API")
 @app.on_event("startup")
 def _startup() -> None:
     _load_model()
+    _load_rerank_model()
 
 
 class EmbedRequest(BaseModel):
     texts: list[str]
+
+
+class RerankRequest(BaseModel):
+    query: str
+    documents: list[str]
+    top_k: int = 12
 
 
 @app.post("/embed")
@@ -109,6 +132,22 @@ def embed(req: EmbedRequest) -> JSONResponse:
         )
         embeddings.extend(v.tolist() for v in vectors)
     return JSONResponse({"embeddings": embeddings})
+
+
+@app.post("/rerank")
+def rerank(req: RerankRequest) -> JSONResponse:
+    if not _rerank_ready or _rerank_model is None:
+        raise HTTPException(status_code=503, detail="Rerank model not ready")
+    if not req.documents:
+        return JSONResponse({"indices": [], "scores": []})
+    pairs = [(req.query, doc) for doc in req.documents]
+    scores: list[float] = _rerank_model.predict(pairs).tolist()
+    indexed = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    top_items = indexed[:req.top_k]
+    return JSONResponse({
+        "indices": [idx for idx, _ in top_items],
+        "scores": [score for _, score in top_items],
+    })
 
 
 @app.get("/health")

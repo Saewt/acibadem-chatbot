@@ -250,6 +250,21 @@ GENERAL_TOPIC_PATTERNS = (
         ('spor', 'sport', 'fitness', 'havuz', 'yüzme', 'yuzme', 'basketbol'),
     ),
     (
+        'student_clubs',
+        'Öğrenci Kulüpleri',
+        (
+            'öğrenci kulüpleri',
+            'ogrenci kulupleri',
+            'kulübü',
+            'kulubu',
+            'kulüp',
+            'kulup',
+            'topluluğu',
+            'toplulugu',
+            'topluluk',
+        ),
+    ),
+    (
         'dormitory',
         'Yurt Bilgileri ve Ücretleri',
         ('yurt', 'konaklama', 'depozito', 'dorm'),

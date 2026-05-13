@@ -388,6 +388,13 @@ class ScraperServiceTests(TestCase):
             )['topic'],
             'sports',
         )
+        self.assertEqual(
+            infer_general_topic_metadata(
+                'https://www.acibadem.edu.tr/ogrenci/acuda-yasam/ogrenci-kulupleri',
+                'Öğrenci Kulüpleri',
+            )['topic'],
+            'student_clubs',
+        )
 
     def test_extract_main_site_page_infers_general_topic_metadata(self):
         html = """
@@ -413,6 +420,31 @@ class ScraperServiceTests(TestCase):
         self.assertEqual(extracted.metadata['topic'], 'library')
         self.assertEqual(extracted.metadata['topic_label'], 'Kütüphane')
         self.assertEqual(extracted.metadata['section_title'], 'Kütüphane')
+
+    def test_extract_main_site_page_infers_student_clubs_topic_metadata(self):
+        html = """
+        <html>
+          <body>
+            <h1 class="page-title">Bilişim Kulübü</h1>
+            <main>
+              <div id="block-acu-content">
+                <p>Bilişim Kulübü teknolojiye ilgi duyan öğrencileri bir araya getirir ve etkinlikler düzenler.</p>
+              </div>
+            </main>
+          </body>
+        </html>
+        """
+
+        extracted = extract_main_site_page(
+            'https://www.acibadem.edu.tr/ogrenci/acuda-yasam/bilisim-kulubu',
+            html,
+        )
+
+        self.assertIsNotNone(extracted)
+        self.assertEqual(extracted.metadata['kind'], 'main_site_page')
+        self.assertEqual(extracted.metadata['topic'], 'student_clubs')
+        self.assertEqual(extracted.metadata['topic_label'], 'Öğrenci Kulüpleri')
+        self.assertEqual(extracted.metadata['section_title'], 'Öğrenci Kulüpleri')
 
     def test_dataset_import_infers_general_topic_metadata(self):
         metadata = _derive_general_page_metadata(

@@ -121,6 +121,32 @@ def embed_text(text: str) -> list[float]:
     return embed_texts([text])[0]
 
 
+def rerank_texts(query: str, documents: list[str], top_k: int) -> list[tuple[int, float]]:
+    if not documents:
+        return []
+    url = f"{settings.EMBEDDING_API_URL.rstrip('/')}/rerank"
+    timeout = settings.RERANK_API_TIMEOUT
+    try:
+        resp = requests.post(
+            url,
+            json={"query": query, "documents": documents, "top_k": top_k},
+            timeout=timeout,
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        raise RuntimeError(f"Rerank API error: {exc}") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Rerank API returned status {resp.status_code}: {resp.text[:200]}"
+        )
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Rerank API returned invalid JSON: {exc}") from exc
+    indices = payload.get("indices", [])
+    scores = payload.get("scores", [])
+    return list(zip(indices, scores))
+
+
 def warm_embedding_model() -> None:
     global _EMBEDDING_MODEL_WARMED
     if _EMBEDDING_MODEL_WARMED:

@@ -12,26 +12,38 @@ from scraper.models import ContentChunk, WebPage
 from .models import Conversation, Message
 from .services import (
     LLM_BUSY_ANSWER,
+    LLM_FORMAT_ERROR_ANSWER,
     LLMBusyError,
     NO_CONTEXT_ANSWER,
+    _clean_llm_answer,
     _extract_question_scope_hints,
     _expanded_query_terms,
     _filter_candidates_for_query,
+    _get_chunk_metadata_value,
     _is_dentistry_query,
+    _is_program_list_query,
     _is_staff_count_query,
     _is_staff_list_query,
     _is_staff_query,
+    _program_list_chunks_for_context,
     _question_topics,
+    _regex_question_topics,
     _resolve_question_with_conversation,
     _retrieve_candidates,
     _retrieve_direct_facility_chunks,
+    _retrieve_direct_program_list_chunks,
     _retrieve_direct_staff_chunks,
+    _semantic_question_topics,
+    _set_request_topics,
+    _clear_request_topics,
+    _vector_distance_threshold,
     build_prompt,
     build_sources,
     cache_key,
     chat,
     chat_stream,
     generate_answer,
+    generate_answer_stream,
     get_llm_client,
     retrieve_keyword_context,
 )
@@ -99,6 +111,115 @@ class ChatServiceTests(TestCase):
         self.assertEqual(body['think'], True)
         self.assertEqual(body['options']['num_predict'], 512)
         response_mock.raise_for_status.assert_called_once()
+
+    def test_clean_llm_answer_strips_qwen_think_output(self):
+        answer = _clean_llm_answer(
+            "Okay, let's think this through.\n</think>\nAcıbadem Üniversitesi'nde kulüpler var. [1]"
+        )
+
+        self.assertEqual(answer, "Acıbadem Üniversitesi'nde kulüpler var. [1]")
+
+    def test_clean_llm_answer_strips_untagged_analysis_before_final_answer(self):
+        answer = _clean_llm_answer(
+            "Okay, let's tackle this user query.\n"
+            "The user is asking for information about the sports hall.\n\n"
+            'Source 1: The title is "Spor ve Sosyal Yaşam".\n'
+            'Source 2: Title "Spor Merkezi".\n\n'
+            'Possible answer: Acıbadem Üniversitesi Spor Merkezi, Kerem Aydınlar '
+            'Kampüsü’nde yer alır ve fitness merkezi, basketbol sahası, koşu '
+            'parkuru, squash kortları, spinning ve pilates stüdyoları gibi '
+            'olanaklar sunar. [1]'
+        )
+
+        self.assertEqual(
+            answer,
+            'Acıbadem Üniversitesi Spor Merkezi, Kerem Aydınlar Kampüsü’nde yer '
+            'alır ve fitness merkezi, basketbol sahası, koşu parkuru, squash '
+            'kortları, spinning ve pilates stüdyoları gibi olanaklar sunar. [1]',
+        )
+
+    def test_clean_llm_answer_strips_cevap_marker(self):
+        answer = _clean_llm_answer(
+            'CEVAP: Acıbadem Üniversitesi Spor Merkezi hakkında bilgi resmi kaynaklarda yer alır. [1]'
+        )
+
+        self.assertEqual(
+            answer,
+            'Acıbadem Üniversitesi Spor Merkezi hakkında bilgi resmi kaynaklarda yer alır. [1]',
+        )
+
+    def test_clean_llm_answer_strips_analysis_before_cevap_marker(self):
+        answer = _clean_llm_answer(
+            "Okay, let's tackle this user query.\n"
+            'Source 1: The page mentions the sports center.\n'
+            'CEVAP: Spor Merkezi; fitness merkezi, yüzme havuzu ve grup dersleri gibi olanaklar sunar. [1]'
+        )
+
+        self.assertEqual(
+            answer,
+            'Spor Merkezi; fitness merkezi, yüzme havuzu ve grup dersleri gibi olanaklar sunar. [1]',
+        )
+
+    def test_clean_llm_answer_rejects_untagged_analysis_without_final_answer(self):
+        answer = _clean_llm_answer(
+            "Okay, let's tackle this user query.\n"
+            'Source 1: The page mentions the sports center.\n'
+            'I need to check each source before answering.'
+        )
+
+        self.assertEqual(answer, LLM_FORMAT_ERROR_ANSWER)
+
+    @override_settings(LLM_BACKEND='ollama', LLM_MAX_TOKENS=512)
+    @patch(
+        'chat.services._ollama_chat_stream',
+        return_value=iter(
+            [
+                "Okay, let's tackle this user query.\n",
+                'Source 1: The page mentions clubs.\n',
+                "Possible answer: Acıbadem Üniversitesi'nde öğrenci kulüpleri vardır. [1]",
+            ]
+        ),
+    )
+    def test_generate_answer_stream_cleans_untagged_analysis_before_yielding(self, _stream_mock):
+        answer_parts = list(generate_answer_stream('Kulüpler var mı?'))
+
+        self.assertEqual(answer_parts, ["Acıbadem Üniversitesi'nde öğrenci kulüpleri vardır. [1]"])
+
+    @override_settings(LLM_BACKEND='ollama', LLM_MAX_TOKENS=512)
+    @patch(
+        'chat.services._ollama_chat',
+        side_effect=[
+            LLM_FORMAT_ERROR_ANSWER,
+            'Acıbadem Üniversitesi Spor Merkezi hakkında resmi kaynaklarda bilgi yer alır. [1]',
+        ],
+    )
+    def test_generate_answer_retries_when_ollama_returns_format_error(self, ollama_chat_mock):
+        answer = generate_answer('spor salonu hakkında bilgi verir misin')
+
+        self.assertEqual(
+            answer,
+            'Acıbadem Üniversitesi Spor Merkezi hakkında resmi kaynaklarda bilgi yer alır. [1]',
+        )
+        self.assertEqual(ollama_chat_mock.call_count, 2)
+        retry_messages = ollama_chat_mock.call_args_list[1].args[0]
+        self.assertIn('Yalnızca "CEVAP:" ile başlayan', retry_messages[1]['content'])
+
+    @override_settings(LLM_BACKEND='ollama', LLM_MAX_TOKENS=512)
+    @patch(
+        'chat.services._ollama_chat_stream',
+        side_effect=[
+            iter(["Okay, let's tackle this.\n", 'Source 1: x\n', 'I need to answer.']),
+            iter(['CEVAP: Spor Merkezi; fitness merkezi ve yüzme havuzu gibi olanaklar sunar. [1]']),
+        ],
+    )
+    def test_generate_answer_stream_retries_when_ollama_returns_format_error(self, stream_mock):
+        answer_parts = list(generate_answer_stream('spor salonu hakkında bilgi verir misin'))
+
+        self.assertEqual(
+            answer_parts,
+            ['Spor Merkezi; fitness merkezi ve yüzme havuzu gibi olanaklar sunar. [1]'],
+        )
+        self.assertEqual(stream_mock.call_count, 2)
 
     @patch('chat.api.chat')
     def test_chat_endpoint_returns_service_payload(self, chat_mock):
@@ -210,7 +331,7 @@ class ChatServiceTests(TestCase):
         key_b = cache_key('  psikoloji   bölümü 5 yarıyıl ders planı  ')
 
         self.assertEqual(key_a, key_b)
-        self.assertTrue(key_a.startswith('chat-answer:v15:'))
+        self.assertTrue(key_a.startswith('chat-answer:v29:'))
 
     @override_settings(RAG_MAX_CHUNK_CHARS=20, RAG_MAX_CONTEXT_CHARS=155)
     def test_build_prompt_trims_context_and_limits_used_chunks(self):
@@ -240,7 +361,7 @@ class ChatServiceTests(TestCase):
         self.assertEqual(used_chunks, [chunk_a])
 
     @override_settings(RAG_MAX_CHUNK_CHARS=30, RAG_MAX_CONTEXT_CHARS=190)
-    def test_build_prompt_expands_context_for_facility_queries(self):
+    def test_build_prompt_respects_context_limit(self):
         page = WebPage.objects.create(
             url='https://example.com/kutuphane',
             source='main_site',
@@ -264,7 +385,7 @@ class ChatServiceTests(TestCase):
         _facility_prompt, facility_chunks = build_prompt('Kütüphane hakkında bilgi verir misin?', [chunk_a, chunk_b])
 
         self.assertEqual(normal_chunks, [chunk_a])
-        self.assertEqual(facility_chunks, [chunk_a, chunk_b])
+        self.assertEqual(facility_chunks, [chunk_a])
 
     def test_query_expansion_applies_only_to_topic_queries(self):
         self.assertIn('library', _expanded_query_terms('kütüphane hakkında bilgi'))
@@ -516,7 +637,10 @@ class ChatServiceTests(TestCase):
 
         resolved = _resolve_question_with_conversation('kaç tane hocası var', conversation)
 
-        self.assertEqual(resolved, 'bilgisayar mühendisliği kaç tane hocası var')
+        self.assertEqual(
+            resolved.casefold(),
+            'Bilgisayar Mühendisliği kaç tane hocası var'.casefold(),
+        )
 
     @override_settings(RAG_RETRIEVE_LIMIT=3, RAG_PER_PAGE_LIMIT=2)
     @patch('chat.services.retrieve_keyword_context')
@@ -2134,6 +2258,38 @@ class ChatServiceTests(TestCase):
         self.assertEqual(Message.objects.filter(role='assistant').get().content, LLM_BUSY_ANSWER)
         generate_answer_mock.assert_not_called()
 
+    @patch('chat.services.generate_answer', return_value=LLM_FORMAT_ERROR_ANSWER)
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_does_not_cache_llm_format_error_answer(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_mock,
+    ):
+        page = WebPage.objects.create(
+            url='https://example.com/format-error',
+            source='main_site',
+            title='Genel Bilgi',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-format-error',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Model gerektiren genel resmi bilgi.',
+        )
+        retrieve_context_mock.return_value = [chunk]
+
+        payload = chat('Genel format hatası üretir misin?')
+
+        self.assertEqual(payload['answer'], LLM_FORMAT_ERROR_ANSWER)
+        self.assertIsNone(cache.get(cache_key('Genel format hatası üretir misin?')))
+        generate_answer_mock.assert_called_once()
+
     @patch('chat.services._acquire_llm_slot', side_effect=LLMBusyError('busy'))
     @patch('chat.services.generate_answer_stream')
     @patch('chat.services.retrieve_keyword_context', return_value=[])
@@ -2170,6 +2326,38 @@ class ChatServiceTests(TestCase):
         self.assertIsNone(cache.get(cache_key('Streaming genel bilgi verir misin?')))
         self.assertEqual(Message.objects.filter(role='assistant').get().content, LLM_BUSY_ANSWER)
         generate_answer_stream_mock.assert_not_called()
+
+    @patch('chat.services.generate_answer_stream', return_value=iter([LLM_FORMAT_ERROR_ANSWER]))
+    @patch('chat.services.retrieve_keyword_context', return_value=[])
+    @patch('chat.services.retrieve_context')
+    @patch('chat.services.embed_query', return_value=[0.1, 0.2, 0.3])
+    def test_chat_stream_does_not_cache_llm_format_error_answer(
+        self,
+        _embed_query_mock,
+        retrieve_context_mock,
+        _retrieve_keyword_context_mock,
+        generate_answer_stream_mock,
+    ):
+        page = WebPage.objects.create(
+            url='https://example.com/stream-format-error',
+            source='main_site',
+            title='Genel Bilgi',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-stream-format-error',
+        )
+        chunk = ContentChunk.objects.create(
+            page=page,
+            chunk_index=0,
+            text='Streaming model gerektiren genel resmi bilgi.',
+        )
+        retrieve_context_mock.return_value = [chunk]
+
+        payload = ''.join(chat_stream('Streaming format hatası üretir misin?'))
+
+        self.assertIn(LLM_FORMAT_ERROR_ANSWER, payload)
+        self.assertIsNone(cache.get(cache_key('Streaming format hatası üretir misin?')))
+        generate_answer_stream_mock.assert_called_once()
 
     def test_is_staff_query_matches_baskan(self):
         self.assertTrue(_is_staff_query('bilgisayar mühendisliği bölüm başkanı kimdir'))
@@ -2254,6 +2442,188 @@ class ChatServiceTests(TestCase):
         )
 
         self.assertEqual(result, [score_chunk])
+
+    def test_program_list_query_matches_engineering_department_question(self):
+        self.assertTrue(_is_program_list_query('hangi mühendislik bölümleri var'))
+        self.assertTrue(_is_program_list_query('Mühendislik ve Doğa Bilimleri Fakültesi bölümleri neler?'))
+
+    def test_filter_candidates_for_engineering_program_list_excludes_non_program_sources(self):
+        bologna_page = WebPage.objects.create(
+            url='https://example.com/bologna-engineering',
+            source='bologna',
+            title='Biyomedikal Mühendisliği - Program Özeti',
+            content_text='Program özeti',
+            raw_html='<main>Program özeti</main>',
+            content_hash='hash-bioeng-overview',
+        )
+        computer_page = WebPage.objects.create(
+            url='https://example.com/computer-engineering',
+            source='bologna',
+            title='Bilgisayar Mühendisliği - Program Özeti',
+            content_text='Program özeti',
+            raw_html='<main>Program özeti</main>',
+            content_hash='hash-compeng-overview',
+        )
+        mbg_page = WebPage.objects.create(
+            url='https://example.com/mbg',
+            source='bologna',
+            title='Moleküler Biyoloji ve Genetik - Program Özeti',
+            content_text='Program özeti',
+            raw_html='<main>Program özeti</main>',
+            content_hash='hash-mbg-overview',
+        )
+        score_page = WebPage.objects.create(
+            url='https://example.com/score-page',
+            source='structured',
+            title='Kontenjan ve Puan',
+            content_text='icerik',
+            raw_html='{}',
+            content_hash='hash-program-list-score',
+        )
+        staff_page = WebPage.objects.create(
+            url='https://example.com/staff-page',
+            source='main_site',
+            title='Akademik Kadro',
+            content_text='icerik',
+            raw_html='<main>icerik</main>',
+            content_hash='hash-program-list-staff',
+        )
+        bioeng_chunk = ContentChunk.objects.create(
+            page=bologna_page,
+            chunk_index=0,
+            text='Biyomedikal Mühendisliği program özeti.',
+            metadata={
+                'kind': 'bologna_program_page',
+                'record_type': 'bologna_program_overview',
+                'program_title': 'Biyomedikal Mühendisliği (İngilizce)',
+                'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+            },
+        )
+        compeng_chunk = ContentChunk.objects.create(
+            page=computer_page,
+            chunk_index=0,
+            text='Bilgisayar Mühendisliği program özeti.',
+            metadata={
+                'kind': 'bologna_program_page',
+                'record_type': 'bologna_program_overview',
+                'program_title': 'Bilgisayar Mühendisliği (İngilizce)',
+                'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+            },
+        )
+        mbg_chunk = ContentChunk.objects.create(
+            page=mbg_page,
+            chunk_index=0,
+            text='Moleküler Biyoloji ve Genetik program özeti.',
+            metadata={
+                'kind': 'bologna_program_page',
+                'record_type': 'bologna_program_overview',
+                'program_title': 'Moleküler Biyoloji ve Genetik (İngilizce)',
+                'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+            },
+        )
+        score_chunk = ContentChunk.objects.create(
+            page=score_page,
+            chunk_index=0,
+            text='Kontenjan ve puan bilgileri.',
+            metadata={
+                'kind': 'structured_admissions_score',
+                'record_type': 'quota_row',
+                'program_title': 'MÜHENDİSLİK VE DOĞA BİLİMLERİ FAKÜLTESİ',
+            },
+        )
+        staff_chunk = ContentChunk.objects.create(
+            page=staff_page,
+            chunk_index=0,
+            text='Akademik kadro listesi.',
+            metadata={
+                'kind': 'main_site_staff_page',
+                'record_type': 'academic_staff_member',
+                'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+            },
+        )
+
+        result = _filter_candidates_for_query(
+            'hangi mühendislik bölümleri var',
+            [score_chunk, mbg_chunk, staff_chunk, bioeng_chunk, compeng_chunk],
+        )
+
+        self.assertEqual(result, [bioeng_chunk, compeng_chunk])
+
+    def test_direct_program_list_retrieval_returns_engineering_program_overviews(self):
+        for title in (
+            'Bilgisayar Mühendisliği (İngilizce)',
+            'Biyomedikal Mühendisliği (İngilizce)',
+            'Moleküler Biyoloji ve Genetik (İngilizce)',
+        ):
+            page = WebPage.objects.create(
+                url=f'https://example.com/{title}',
+                source='bologna',
+                title=f'{title} - Program Özeti',
+                content_text='Program özeti',
+                raw_html='<main>Program özeti</main>',
+                content_hash=f'hash-{title}',
+            )
+            ContentChunk.objects.create(
+                page=page,
+                chunk_index=0,
+                text=f'{title} program özeti.',
+                metadata={
+                    'kind': 'bologna_program_page',
+                    'record_type': 'bologna_program_overview',
+                    'program_title': title,
+                    'faculty': 'Mühendislik ve Doğa Bilimleri Fakültesi',
+                },
+            )
+
+        results = _retrieve_direct_program_list_chunks('hangi mühendislik bölümleri var', limit=6)
+        titles = [_get_chunk_metadata_value(chunk, 'program_title') for chunk in results]
+
+        self.assertEqual(
+            titles,
+            ['Bilgisayar Mühendisliği (İngilizce)', 'Biyomedikal Mühendisliği (İngilizce)'],
+        )
+
+    def test_program_list_context_keeps_one_chunk_per_engineering_program(self):
+        chunks = []
+        for title, page_suffix in (
+            ('Bilgisayar Mühendisliği (İngilizce)', 'computer-about'),
+            ('Bilgisayar Mühendisliği (İngilizce)', 'computer-outcomes'),
+            ('Biyomedikal Mühendisliği (İngilizce)', 'bio-about'),
+            ('Tıp Mühendisliği (İngilizce)', 'medical-engineering-about'),
+            ('Moleküler Biyoloji ve Genetik (İngilizce)', 'mbg-about'),
+        ):
+            page = WebPage.objects.create(
+                url=f'https://example.com/{page_suffix}',
+                source='bologna',
+                title=f'{title} - Programı Bilgileri',
+                content_text='Program bilgisi',
+                raw_html='<main>Program bilgisi</main>',
+                content_hash=f'hash-{page_suffix}',
+            )
+            chunks.append(
+                ContentChunk.objects.create(
+                    page=page,
+                    chunk_index=0,
+                    text=f'{title} program bilgisi.',
+                    metadata={
+                        'kind': 'bologna_program_page',
+                        'program_title': title,
+                        'faculty': (
+                            'Mühendislik Fakültesi'
+                            if title == 'Tıp Mühendisliği (İngilizce)'
+                            else 'Mühendislik ve Doğa Bilimleri Fakültesi'
+                        ),
+                    },
+                )
+            )
+
+        selected = _program_list_chunks_for_context('hangi mühendislik bölümleri var', chunks)
+        titles = [_get_chunk_metadata_value(chunk, 'program_title') for chunk in selected]
+
+        self.assertEqual(
+            titles,
+            ['Bilgisayar Mühendisliği (İngilizce)', 'Biyomedikal Mühendisliği (İngilizce)'],
+        )
 
     @patch('chat.services.generate_answer')
     @patch('chat.services.retrieve_keyword_context', return_value=[])
@@ -2590,3 +2960,191 @@ class WarmModelsCommandTests(TestCase):
         )
         self.assertIn(campus_chunk, filtered)
         self.assertNotIn(score_chunk, filtered)
+
+    @override_settings(
+        RAG_RETRIEVE_LIMIT=3,
+        RAG_PER_PAGE_LIMIT=3,
+        RAG_QUERY_EXPANSION_ENABLED=True,
+    )
+    def test_direct_facility_retrieval_prefers_student_club_pages(self):
+        club_page = WebPage.objects.create(
+            url='https://example.com/ogrenci-kulupleri',
+            source='main_site',
+            title='Öğrenci Kulüpleri',
+            content_text='Kulüp listesi',
+            raw_html='<main>Kulüp listesi</main>',
+            content_hash='hash-club-list',
+        )
+        scholarship_page = WebPage.objects.create(
+            url='https://example.com/burs',
+            source='main_site',
+            title='Burs Olanakları',
+            content_text='Burslar',
+            raw_html='<main>Burslar</main>',
+            content_hash='hash-burs',
+        )
+        club_chunk = ContentChunk.objects.create(
+            page=club_page,
+            chunk_index=0,
+            text='Öğrenci kulüpleri arasında Bilişim Kulübü ve Satranç Kulübü bulunur.',
+            metadata={'kind': 'main_site_page', 'topic': 'student_clubs'},
+        )
+        ContentChunk.objects.create(
+            page=scholarship_page,
+            chunk_index=0,
+            text='Burs olanakları ve indirimler hakkında bilgi.',
+            metadata={'kind': 'main_site_page', 'source_group': 'scholarship'},
+        )
+
+        results = _retrieve_direct_facility_chunks('okulda hangi kulüpler var?', limit=5)
+
+        self.assertEqual(results, [club_chunk])
+
+    def test_filter_candidates_excludes_scholarships_for_student_club_query(self):
+        club_page = WebPage.objects.create(
+            url='https://example.com/bilisim-kulubu',
+            source='main_site',
+            title='Bilişim Kulübü',
+            content_text='Kulüp detayları',
+            raw_html='<main>Kulüp detayları</main>',
+            content_hash='hash-bilisim',
+        )
+        scholarship_page = WebPage.objects.create(
+            url='https://example.com/burs',
+            source='main_site',
+            title='Burs Olanakları',
+            content_text='Burslar',
+            raw_html='<main>Burslar</main>',
+            content_hash='hash-burs-filter',
+        )
+        club_chunk = ContentChunk.objects.create(
+            page=club_page,
+            chunk_index=0,
+            text='Bilişim Kulübü yazılım ve yapay zeka etkinlikleri düzenler.',
+            metadata={'kind': 'main_site_page', 'topic': 'student_clubs'},
+        )
+        scholarship_chunk = ContentChunk.objects.create(
+            page=scholarship_page,
+            chunk_index=0,
+            text='Burs olanakları öğrencilere finansal destek sunar.',
+            metadata={'kind': 'main_site_page', 'source_group': 'scholarship'},
+        )
+
+        filtered = _filter_candidates_for_query(
+            'okulda hangi kulüpler var?',
+            [scholarship_chunk, club_chunk],
+        )
+
+        self.assertEqual(filtered, [club_chunk])
+
+
+@override_settings(
+    CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
+)
+class SemanticTopicTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        _clear_request_topics()
+
+    def tearDown(self):
+        _clear_request_topics()
+
+    def test_regex_topic_matches_kampus_sosyal(self):
+        topics = _regex_question_topics('Kampüste hangi sosyal imkanlar var?')
+        self.assertIn('campus_life', topics)
+
+    def test_regex_topic_matches_yemekhane(self):
+        topics = _regex_question_topics('Yemekhane var mı?')
+        self.assertIn('campus_life', topics)
+
+    def test_regex_topic_does_not_match_kulup_alone(self):
+        topics = _regex_question_topics('okulda hangi kulüpler var?')
+        self.assertIn('student_clubs', topics)
+        self.assertNotIn('campus_life', topics)
+
+    def test_semantic_topic_detects_kulup_query(self):
+        from unittest.mock import patch
+        from chat.services import TOPIC_DESCRIPTIONS
+        fake_centroid = [0.1] * 384
+        fake_centroid[0] = 0.9
+        import math
+        norm = math.sqrt(sum(c ** 2 for c in fake_centroid))
+        fake_centroid = [c / norm for c in fake_centroid]
+
+        query_emb = [0.1] * 384
+        query_emb[0] = 0.85
+        norm2 = math.sqrt(sum(c ** 2 for c in query_emb))
+        query_emb = [c / norm2 for c in query_emb]
+
+        with override_settings(SEMANTIC_TOPIC_ENABLED=True, SEMANTIC_TOPIC_THRESHOLD=0.3):
+            with patch('chat.services._get_topic_centroids', return_value={'student_clubs': fake_centroid}):
+                topics = _semantic_question_topics(query_emb)
+                self.assertIn('student_clubs', topics)
+
+    def test_semantic_topic_disabled_returns_empty(self):
+        with override_settings(SEMANTIC_TOPIC_ENABLED=False):
+            topics = _semantic_question_topics([0.1] * 384)
+            self.assertEqual(topics, set())
+
+    def test_question_topics_uses_cached_topics(self):
+        _set_request_topics({'campus_life', 'library'})
+        topics = _question_topics('any question')
+        self.assertEqual(topics, {'campus_life', 'library'})
+
+    def test_question_topics_falls_back_to_regex_when_no_cache(self):
+        topics = _question_topics('Yemekhane var mı?')
+        self.assertIn('campus_life', topics)
+
+    def test_combined_topics_regex_and_semantic(self):
+        from unittest.mock import patch
+        fake_centroid = [0.0] * 384
+        fake_centroid[10] = 1.0
+
+        query_emb = [0.0] * 384
+        query_emb[10] = 0.9
+        import math
+        norm = math.sqrt(sum(c ** 2 for c in query_emb))
+        query_emb = [c / norm for c in query_emb]
+
+        with override_settings(SEMANTIC_TOPIC_ENABLED=True, SEMANTIC_TOPIC_THRESHOLD=0.3):
+            with patch('chat.services._get_topic_centroids', return_value={'sports': fake_centroid}):
+                semantic = _semantic_question_topics(query_emb)
+                self.assertIn('sports', semantic)
+
+        regex_topics = _regex_question_topics('Kampüste kütüphane var mı?')
+        self.assertIn('campus_life', regex_topics)
+        self.assertIn('library', regex_topics)
+
+    @override_settings(
+        RAG_VECTOR_DISTANCE_STRICT=0.72,
+        RAG_VECTOR_DISTANCE_BROAD=0.85,
+    )
+    def test_vector_threshold_broad_for_general_queries(self):
+        with override_settings(SEMANTIC_TOPIC_ENABLED=False):
+            threshold = _vector_distance_threshold('okulda hangi kulüpler var?')
+            self.assertEqual(threshold, 0.85)
+
+    @override_settings(
+        RAG_VECTOR_DISTANCE_STRICT=0.72,
+        RAG_VECTOR_DISTANCE_BROAD=0.85,
+    )
+    def test_vector_threshold_strict_for_score_queries(self):
+        threshold = _vector_distance_threshold('Bilgisayar mühendisliği taban puanları kaç?')
+        self.assertEqual(threshold, 0.72)
+
+    @override_settings(
+        RAG_VECTOR_DISTANCE_STRICT=0.72,
+        RAG_VECTOR_DISTANCE_BROAD=0.85,
+    )
+    def test_vector_threshold_strict_for_course_queries(self):
+        threshold = _vector_distance_threshold('Bilgisayar mühendisliği dersleri neler?')
+        self.assertEqual(threshold, 0.72)
+
+    @override_settings(
+        RAG_VECTOR_DISTANCE_STRICT=0.72,
+        RAG_VECTOR_DISTANCE_BROAD=0.85,
+    )
+    def test_vector_threshold_broad_for_campus_queries(self):
+        with override_settings(SEMANTIC_TOPIC_ENABLED=False):
+            threshold = _vector_distance_threshold('Kampüste yemekhane var mı?')
+            self.assertEqual(threshold, 0.85)
